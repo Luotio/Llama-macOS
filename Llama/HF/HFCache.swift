@@ -621,11 +621,11 @@ enum HFCache {
       GGUFMetadata.hasEmbeddedMTPHead(path: mainFilePath)
       ?? fileHasMTPHead(URL(fileURLWithPath: filename).lastPathComponent)
 
-    // Decision models answer `/v1/systemone` instead of chatting; the menu
-    // hides chat actions for them and `models.ini` tags them apart (see
-    // `ModelManager.generatedModelSections`). An unparseable header reads as
-    // a chat model -- the behavior every model had before this check existed.
-    let isDecisionModel = GGUFMetadata.isDecisionModel(path: mainFilePath) ?? false
+    // Decision and embedding models don't chat -- they answer `/v1/systemone`
+    // and `/v1/embeddings`. The menu hides chat actions for them, and
+    // `models.ini` tags them apart and turns embeddings on (see
+    // `ModelManager.generatedModelSections`).
+    let kind = GGUFMetadata.kind(path: mainFilePath)
 
     let entry = Model(
       id: modelId,
@@ -637,7 +637,7 @@ enum HFCache {
       // them apart because they produce different `models.ini` lines.
       scannedDraftHead: draftSidecar.flatMap { DraftHead(sidecarPath: $0) }
         ?? (hasEmbeddedHead ? .mtp : nil),
-      isDecisionModel: isDecisionModel
+      kind: kind
     )
 
     // Build resolved paths

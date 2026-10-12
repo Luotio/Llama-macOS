@@ -328,7 +328,7 @@ final class MenuController: NSObject, NSMenuDelegate {
           color: Theme.Colors.textPrimary,
           hasVision: model.hasVisionSupport,
           draftHead: model.draftHead,
-          isDecision: model.isDecisionModel,
+          kind: model.kind,
           showTags: collidingKeys.contains(ModelIdParser.displayKey(model.id))
         )
       })
@@ -619,6 +619,20 @@ final class MenuController: NSObject, NSMenuDelegate {
     return items
   }
 
+  /// Where a non-chat model's page sends people to learn its API; nil for
+  /// chat models, whose page leads with Chat instead.
+  private static func howToUseUrl(for kind: ModelKind) -> URL? {
+    switch kind {
+    case .chat: nil
+    case .decision: URL(string: "https://huggingface.co/blog/ggml-org/decision-models-in-llamacpp")
+    case .embedding:
+      URL(
+        string:
+          "https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#post-v1embeddings-openai-compatible-embeddings-api"
+      )
+    }
+  }
+
   /// Replaces the list body with one model's page. A static header establishes
   /// identity and exposes page-level actions; settings below use the full width.
   private func addModelPage(to menu: NSMenu, model: Model, models: [Model]) {
@@ -647,19 +661,17 @@ final class MenuController: NSObject, NSMenuDelegate {
     // (the primary action on a model); Unload appears only while the model is
     // loaded (status-change rebuilds keep it current); Delete closes the set.
     menu.addItem(NSMenuItem.viewItem(with: SeparatorView()))
-    // Decision models can't chat and the request builder only writes chat
-    // requests, so both rows are left off their pages -- a Chat row that
-    // opens a WebUI erroring on every message is worse than no row. In Chat's
-    // place, the primary action is learning how to call one: the only way to
-    // use a decision model is the `/v1/systemone` API, and the llama.cpp blog
-    // post walks through a request and its response.
-    if model.isDecisionModel {
+    // Decision and embedding models can't chat and the request builder only
+    // writes chat requests, so both rows are left off their pages -- a Chat
+    // row that opens a WebUI erroring on every message is worse than no row.
+    // In Chat's place, the primary action is learning how to call one: the API
+    // is the only way to use these, so the row links its docs -- the llama.cpp
+    // blog post walks through a `/v1/systemone` request and response, and the
+    // server README documents `/v1/embeddings`.
+    if let howToUrl = Self.howToUseUrl(for: model.kind) {
       let howToRow = ActionItemView(title: "How to use", symbol: "book") {}
       howToRow.onAction = { [weak howToRow] in
-        guard
-          let url = URL(string: "https://huggingface.co/blog/ggml-org/decision-models-in-llamacpp")
-        else { return }
-        howToRow?.openInBrowser(url)
+        howToRow?.openInBrowser(howToUrl)
       }
       menu.addItem(NSMenuItem.viewItem(with: howToRow))
     } else {
@@ -692,7 +704,7 @@ final class MenuController: NSObject, NSMenuDelegate {
     // implied they were for different things -- which taught exactly the wrong
     // lesson, since the builder exists to answer the questions the bare curl
     // left you with (how do I turn thinking off, add a schema, send an image).
-    if !model.isDecisionModel {
+    if model.kind == .chat {
       let builderRow = ActionItemView(title: "Build an API request", symbol: "curlybraces") {}
       builderRow.onAction = { [weak builderRow] in
         // Opened through the row so the menu dismisses with the navigation --

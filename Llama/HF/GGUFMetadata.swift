@@ -61,6 +61,27 @@ enum GGUFMetadata {
     value(forKeySuffix: ".decision.type", path: path) { _, _ in () }.map { $0 != nil }
   }
 
+  /// Whether the GGUF at `path` is an embedding model, per its
+  /// `<arch>.pooling_type` key -- how llama.cpp pools token states into one
+  /// vector (`llama_pooling_type`: 1 mean, 2 cls, 3 last). Chat models don't
+  /// carry the key. 4 (rank) marks a reranker, which scores pairs rather than
+  /// embedding, so it isn't counted. Returns nil when the header can't be
+  /// parsed.
+  static func isEmbeddingModel(path: String) -> Bool? {
+    intValue(forKeySuffix: ".pooling_type", path: path).map { (1...3).contains($0 ?? 0) }
+  }
+
+  /// The model's kind, from the two checks above. Decision is tested first:
+  /// some decision models are built on encoders that may also carry a pooling
+  /// type, and what they're served as is the decision endpoint. An unparseable
+  /// header reads as a chat model -- the behavior every model had before kinds
+  /// existed.
+  static func kind(path: String) -> ModelKind {
+    if isDecisionModel(path: path) == true { return .decision }
+    if isEmbeddingModel(path: path) == true { return .embedding }
+    return .chat
+  }
+
   // MARK: - Header parsing
 
   /// GGUF metadata value types, per the spec's `gguf_metadata_value_type`.

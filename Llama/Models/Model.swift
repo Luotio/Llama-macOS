@@ -45,12 +45,13 @@ struct Model: Identifiable, Codable {
   /// `HFCache.buildSideloadedEntry`); the deeplink path leaves it nil and
   /// carries the sidecar in `draftUrl` instead. Read it through `draftHead`.
   let scannedDraftHead: DraftHead?
-  /// Whether this is a decision model -- one that scores the options of typed
-  /// questions through llama-server's `/v1/systemone` endpoint instead of
-  /// chatting. Read from the GGUF header by the cache scan (see
-  /// `GGUFMetadata.isDecisionModel`); the deeplink path can't know it before
-  /// the file is on disk, so it leaves this false.
-  let isDecisionModel: Bool
+  /// What the model does, which decides how it's served and offered: a chat
+  /// model generates text; a decision model scores the options of typed
+  /// questions through `/v1/systemone`; an embedding model turns input into
+  /// vectors through `/v1/embeddings`. Read from the GGUF header by the cache
+  /// scan (see `GGUFMetadata.kind`); the deeplink path can't know it before the
+  /// file is on disk, so it leaves this `.chat`.
+  let kind: ModelKind
 
   init(
     id: String,
@@ -63,7 +64,7 @@ struct Model: Identifiable, Codable {
     mmprojUrl: URL? = nil,
     draftUrl: URL? = nil,
     scannedDraftHead: DraftHead? = nil,
-    isDecisionModel: Bool = false
+    kind: ModelKind = .chat
   ) {
     self.id = id
     self.ctxWindow = ctxWindow
@@ -75,10 +76,10 @@ struct Model: Identifiable, Codable {
     self.mmprojUrl = mmprojUrl
     self.draftUrl = draftUrl
     self.scannedDraftHead = scannedDraftHead
-    self.isDecisionModel = isDecisionModel
+    self.kind = kind
   }
 
-  /// Decoding treats `isDecisionModel` and `scannedDraftHead` as optional:
+  /// Decoding treats `kind` and `scannedDraftHead` as optional:
   /// download placeholders are `Model`s written to disk by earlier app
   /// versions, and a required key would make every paused download from before
   /// the field existed fail to decode and silently drop out of the list.
@@ -94,13 +95,14 @@ struct Model: Identifiable, Codable {
     mmprojUrl = try c.decodeIfPresent(URL.self, forKey: .mmprojUrl)
     // Placeholders from before DFlash support stored the sidecar as `mtpUrl`
     // (and an always-false `hasMTPHead`, which is safe to drop -- placeholders
-    // come from the deeplink path, which never sets it).
+    // come from the deeplink path, which never sets it). The same goes for the
+    // always-false `isDecisionModel` that `kind` replaced.
     let legacy = try decoder.container(keyedBy: LegacyCodingKeys.self)
     draftUrl =
       try c.decodeIfPresent(URL.self, forKey: .draftUrl)
       ?? legacy.decodeIfPresent(URL.self, forKey: .mtpUrl)
     scannedDraftHead = try c.decodeIfPresent(DraftHead.self, forKey: .scannedDraftHead)
-    isDecisionModel = try c.decodeIfPresent(Bool.self, forKey: .isDecisionModel) ?? false
+    kind = try c.decodeIfPresent(ModelKind.self, forKey: .kind) ?? .chat
   }
 
   /// Keys older app versions wrote that the current shape no longer has.
@@ -227,5 +229,25 @@ struct Model: Identifiable, Codable {
     let keyOrder = lhs.sortKey.caseInsensitiveCompare(rhs.sortKey)
     if keyOrder != .orderedSame { return keyOrder == .orderedAscending }
     return lhs.id < rhs.id
+  }
+}
+
+/// What a model does. The raw value is also its `tags` entry in `models.ini`,
+/// which llama-server passes through to `/v1/models` -- the only place there a
+/// client can tell a chat model from the others (all read text-in/text-out in
+/// the listing's `architecture` modalities).
+enum ModelKind: String, Codable {
+  case chat
+  case decision
+  case embedding
+
+  /// The row chip for a model that can't chat; nil for chat models, which are
+  /// the default and need no label.
+  var chipLabel: String? {
+    switch self {
+    case .chat: nil
+    case .decision: "Decision"
+    case .embedding: "Embedding"
+    }
   }
 }

@@ -282,7 +282,7 @@ extension Format {
     color: NSColor,
     hasVision: Bool = false,
     draftHead: DraftHead? = nil,
-    isDecision: Bool = false,
+    kind: ModelKind = .chat,
     showTags: Bool = false,
     font: NSFont = Theme.Fonts.primary
   ) -> NSAttributedString {
@@ -330,13 +330,13 @@ extension Format {
       result.append(NSAttributedString(string: " "))
       result.append(chip(draftHead.label, style: .rounded, nameFont: font))
     }
-    // Decision models can't chat (they score options through `/v1/systemone`),
-    // so the row says so up front -- otherwise one looks like any other small
-    // model and the missing Chat action reads as a bug. Same chip treatment as
-    // the draft head: a fact about the weights, sitting with the other metadata.
-    if isDecision {
+    // Decision and embedding models can't chat, so the row says what they are
+    // up front -- otherwise one looks like any other small model and the
+    // missing Chat action reads as a bug. Same chip treatment as the draft
+    // head: a fact about the weights, sitting with the other metadata.
+    if let kindLabel = kind.chipLabel {
       result.append(NSAttributedString(string: " "))
-      result.append(chip("Decision", style: .rounded, nameFont: font))
+      result.append(chip(kindLabel, style: .rounded, nameFont: font))
     }
     if showTags && !parsed.tags.isEmpty {
       // Tags render as bare extra-dimmed text, no pill: they're name residue,

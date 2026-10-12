@@ -216,10 +216,11 @@ final class GlobalInputController {
     NSWorkspace.shared.open(url)
   }
 
-  /// Installed models the panel can chat with. Decision models are left out:
-  /// they only answer `/v1/systemone`, so a prompt sent to one would fail.
+  /// Installed models the panel can chat with. Decision and embedding models
+  /// are left out: they only answer `/v1/systemone` / `/v1/embeddings`, so a
+  /// prompt sent to one would fail.
   private static var chatModels: [Model] {
-    ModelManager.shared.downloadedModels.filter { !$0.isDecisionModel }
+    ModelManager.shared.downloadedModels.filter { $0.kind == .chat }
   }
 
   /// Resolve which model the chip should open on, preferring the stickiest

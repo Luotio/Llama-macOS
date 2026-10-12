@@ -528,12 +528,19 @@ class ModelManager: NSObject, URLSessionDataDelegate {
 
       // What kind of model this is, for clients reading `/v1/models`: the
       // OpenAI-style listing has no field for it, and its `architecture`
-      // modalities read text-in/text-out for chat and decision models alike.
+      // modalities read text-in/text-out for every kind alike.
       // llama-server passes `tags` through to each listing entry verbatim
       // (it doesn't route on them), so a client can offer only `chat` models
       // in a chat picker. Untagged models -- written by earlier app versions
       // -- were all chat models, so clients can read a missing tag as `chat`.
-      section.set("tags", model.isDecisionModel ? "decision" : "chat")
+      section.set("tags", model.kind.rawValue)
+
+      // llama-server only serves `/v1/embeddings` for a model started with
+      // `--embeddings`. The flag also restricts the instance to embedding
+      // (it can't generate), which is all an embedding model does anyway.
+      if model.kind == .embedding {
+        section.set("embeddings", "true")
+      }
 
       // Names the user pointed at this model in Settings > Aliases.
       ModelAliases.apply(to: &section)
