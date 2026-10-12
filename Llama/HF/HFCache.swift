@@ -626,6 +626,13 @@ enum HFCache {
     // `models.ini` tags them apart and turns embeddings on (see
     // `ModelManager.generatedModelSections`).
     let kind = GGUFMetadata.kind(path: mainFilePath)
+    // Models llama.cpp takes in one batch per input (see
+    // `ResolvedPaths.batchesWholeInput`): embedding models, and the decision
+    // types it scores from the embeddings output in a single pass.
+    let batchesWholeInput =
+      kind == .embedding
+      || (kind == .decision
+        && ["laya", "clef", "lfm2-d1-omni"].contains(GGUFMetadata.decisionType(path: mainFilePath)))
 
     let entry = Model(
       id: modelId,
@@ -657,6 +664,7 @@ enum HFCache {
       mmprojFile: mmprojFile,
       usesMTP: draftSidecar == nil && hasEmbeddedHead,
       draftSidecarFile: draftSidecar,
+      batchesWholeInput: batchesWholeInput,
       hfRepoDirName: repoDir
     )
 

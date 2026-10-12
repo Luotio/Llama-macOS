@@ -61,6 +61,18 @@ enum GGUFMetadata {
     value(forKeySuffix: ".decision.type", path: path) { _, _ in () }.map { $0 != nil }
   }
 
+  /// A decision model's `<arch>.decision.type` value (e.g. `laya`, `kev`,
+  /// `clef`) -- which of llama.cpp's scoring schemes it uses. Nil when the
+  /// key is absent, isn't a string, or the header can't be parsed.
+  static func decisionType(path: String) -> String? {
+    // Three layers of nil (header unparseable / key absent / not a string)
+    // all mean "no type" here, so flatten them.
+    let found = value(forKeySuffix: ".decision.type", path: path) { cursor, type in
+      type == .string ? cursor.readString() : nil
+    }
+    return found.flatMap { $0 }.flatMap { $0 }
+  }
+
   /// Whether the GGUF at `path` is an embedding model, per its
   /// `<arch>.pooling_type` key -- how llama.cpp pools token states into one
   /// vector (`llama_pooling_type`: 1 mean, 2 cls, 3 last). Chat models don't

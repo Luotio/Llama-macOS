@@ -653,17 +653,8 @@ final class MenuController: NSObject, NSMenuDelegate {
       showTags: showTags
     )
     menu.addItem(NSMenuItem.viewItem(with: header))
-    // No context picker for embedding models. For them the context is the
-    // longest input they accept, and memory grows steeply with it (the whole
-    // input is one batch -- see `ModelManager.generatedModelSections`), so
-    // larger tiers would trade a lot of memory for inputs few people send. The
-    // tiers above would also overstate the model: EmbeddingGemma 2's file
-    // declares 256k while it's trained for 8k. The row still shows the context
-    // in effect.
-    if model.kind != .embedding {
-      menu.addItem(NSMenuItem.viewItem(with: ExpandedModelDetailsView(
-        model: model, server: server)))
-    }
+    menu.addItem(NSMenuItem.viewItem(with: ExpandedModelDetailsView(
+      model: model, server: server)))
 
     // Page actions as labeled menu rows -- bezel buttons read as dialog chrome
     // inside a menu and gray out whenever the app isn't frontmost. Chat leads

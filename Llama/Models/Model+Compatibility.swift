@@ -226,9 +226,20 @@ extension Model {
 
   /// The effective context tier for this model.
   /// Returns user's selection if set and still compatible, otherwise 4K.
+  ///
+  /// Models that don't chat always get 4K. For them context is the longest
+  /// input they accept, and their inputs -- a ticket, a message, a chunk of a
+  /// document -- are short and self-contained, unlike a conversation that keeps
+  /// growing; a larger context would mostly spend memory for nothing. So
+  /// their page has no picker, and a selection saved before that (decision
+  /// models had one in 0.44.0) is ignored rather than left invisibly in force.
   var effectiveCtxTier: ContextTier? {
     let supported = supportedContextTiers
     guard !supported.isEmpty else { return nil }
+
+    if kind != .chat {
+      return supported.contains(.k4) ? .k4 : supported.first
+    }
 
     // Check if user has a saved preference that's still valid
     if let selected = UserSettings.selectedCtxTier(for: id),

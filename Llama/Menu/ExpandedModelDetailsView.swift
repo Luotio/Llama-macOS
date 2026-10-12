@@ -63,7 +63,17 @@ final class ExpandedModelDetailsView: ItemView {
     // For sideloaded models awaiting their MemProfile, show a placeholder message
     // instead of the picker (we don't have accurate memory estimates yet).
     // For failed estimation (-1), show a failure message with the 4k fallback.
-    if model.ctxBytesPer1kTokens == 0 {
+    if model.kind != .chat {
+      // Models that don't chat run at a fixed context (see
+      // `Model.effectiveCtxTier`), so there's nothing to pick. What the
+      // context means for them is the longest input they take, so say that
+      // in those words rather than "context length". A models.user.ini
+      // `ctx-size` wins, as it does in the server.
+      let limit =
+        UserModelOverrides.overriddenCtxSize(for: model.id).map(Format.ctxOverride)
+        ?? model.effectiveCtxTier?.shortLabel ?? ContextTier.k4.shortLabel
+      mainStack.addArrangedSubview(makeInfoLabel("Accepts inputs up to \(limit) tokens"))
+    } else if model.ctxBytesPer1kTokens == 0 {
       mainStack.addArrangedSubview(makeInfoLabel("Estimating memory requirements..."))
     } else if model.ctxBytesPer1kTokens < 0 {
       mainStack.addArrangedSubview(

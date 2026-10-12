@@ -22,6 +22,14 @@ struct ResolvedPaths {
   /// `usesMTP` -- a sidecar is what the repo's authors chose to ship for
   /// drafting, and a DFlash one beats an embedded MTP head outright.
   let draftSidecarFile: String?
+  /// Whether llama-server has to take each input to this model in a single
+  /// batch, which makes the batch size -- not the context -- the longest input
+  /// it accepts. True for embedding models (they attend in both directions)
+  /// and for decision models llama.cpp scores from its embeddings output in
+  /// one pass (`laya`, `clef`, `lfm2-d1-omni` -- see
+  /// `common_init_result` in llama.cpp's `common.cpp`). `models.ini` sizes
+  /// their batches to the context.
+  let batchesWholeInput: Bool
   /// HF cache repo directory name (e.g. "models--bartowski--Llama-3.2-1B-Instruct-GGUF").
   /// Used by deletion to clean up the per-repo directory tree.
   let hfRepoDirName: String
@@ -32,6 +40,7 @@ struct ResolvedPaths {
     mmprojFile: String?,
     usesMTP: Bool = false,
     draftSidecarFile: String? = nil,
+    batchesWholeInput: Bool = false,
     hfRepoDirName: String
   ) {
     self.modelFile = modelFile
@@ -39,6 +48,7 @@ struct ResolvedPaths {
     self.mmprojFile = mmprojFile
     self.usesMTP = usesMTP
     self.draftSidecarFile = draftSidecarFile
+    self.batchesWholeInput = batchesWholeInput
     self.hfRepoDirName = hfRepoDirName
   }
 
