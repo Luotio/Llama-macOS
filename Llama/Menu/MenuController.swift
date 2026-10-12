@@ -338,7 +338,7 @@ final class MenuController: NSObject, NSMenuDelegate {
     // whose model has since disappeared already fell back to the list.
     if let pageModel {
       addModelPage(to: menu, model: pageModel, models: managed)
-      addFooter(to: menu)
+      addFooter(to: menu, separatorHeight: SeparatorView.pageHeight)
       renderedManagedIds = Set(managed.map(\.id))
       return
     }
@@ -505,8 +505,8 @@ final class MenuController: NSObject, NSMenuDelegate {
     }
   }
 
-  private func addFooter(to menu: NSMenu) {
-    menu.addItem(NSMenuItem.viewItem(with: SeparatorView()))
+  private func addFooter(to menu: NSMenu, separatorHeight: CGFloat = 12) {
+    menu.addItem(NSMenuItem.viewItem(with: SeparatorView(height: separatorHeight)))
 
     let footerView = FooterView(
       llamaVersion: LlamaInstallManager.shared.currentVersion?.tag,
@@ -660,7 +660,7 @@ final class MenuController: NSObject, NSMenuDelegate {
     // inside a menu and gray out whenever the app isn't frontmost. Chat leads
     // (the primary action on a model); Unload appears only while the model is
     // loaded (status-change rebuilds keep it current); Delete closes the set.
-    menu.addItem(NSMenuItem.viewItem(with: SeparatorView()))
+    menu.addItem(NSMenuItem.viewItem(with: SeparatorView(height: SeparatorView.pageHeight)))
     // Decision and embedding models can't chat and the request builder only
     // writes chat requests, so both rows are left off their pages -- a Chat
     // row that opens a WebUI erroring on every message is worse than no row.

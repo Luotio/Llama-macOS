@@ -54,6 +54,51 @@ final class ExpandedModelDetailsView: ItemView {
     return label
   }
 
+  /// The section's header line: `label` in the tier labels' tint, ` · detail`
+  /// dimmer, then a `?` whose tooltip explains the section. Shared by the
+  /// context picker's header and the fixed-limit line that replaces the picker
+  /// for models that don't chat, so both read as the same section. The `?` is
+  /// hover-only, invisible to those who don't need it; a tooltip (not an
+  /// NSPopover) because this view is hosted in the menu, whose event tracking a
+  /// popover would fight.
+  private func makeHeaderRow(
+    label: String, detail: String, infoDescription: String, toolTip: String
+  ) -> NSView {
+    // 12pt rather than the 11pt secondary font: this line heads the page's
+    // one section, between a 15pt title and 13pt rows, and at 11 it read as
+    // a footnote.
+    let font = NSFont.systemFont(ofSize: 12)
+    let header = Theme.secondaryLabel()
+    let headerText = NSMutableAttributedString(
+      string: label,
+      attributes: [
+        .font: font,
+        .foregroundColor: Theme.Colors.modelIconTint,
+      ])
+    headerText.append(NSAttributedString(
+      string: " · \(detail)",
+      attributes: [
+        .font: font,
+        .foregroundColor: Theme.Colors.textTertiary,
+      ]))
+    header.attributedStringValue = headerText
+
+    let info = NSImageView(
+      image: NSImage(
+        systemSymbolName: "questionmark.circle",
+        accessibilityDescription: infoDescription) ?? NSImage())
+    info.contentTintColor = Theme.Colors.textTertiary
+    info.symbolConfiguration = .init(pointSize: 12, weight: .regular)
+    info.toolTip = toolTip
+
+    // Header text and the `?` on one line, left-aligned and snug together.
+    let headerRow = NSStackView(views: [header, info])
+    headerRow.orientation = .horizontal
+    headerRow.alignment = .centerY
+    headerRow.spacing = 4
+    return headerRow
+  }
+
   private func setupLayout() {
     let mainStack = NSStackView()
     mainStack.orientation = .vertical
@@ -65,14 +110,35 @@ final class ExpandedModelDetailsView: ItemView {
     // For failed estimation (-1), show a failure message with the 4k fallback.
     if model.kind != .chat {
       // Models that don't chat run at a fixed context (see
-      // `Model.effectiveCtxTier`), so there's nothing to pick. What the
-      // context means for them is the longest input they take, so say that
-      // in those words rather than "context length". A models.user.ini
-      // `ctx-size` wins, as it does in the server.
+      // `Model.effectiveCtxTier`), so there's nothing to pick -- just the
+      // limit, as one line in the picker header's own style ("Context
+      // length · memory use ⓘ" on a chat model's page), so the slot reads as
+      // the same section with the control taken away rather than as a stray
+      // caption. What the context means for these models is the longest input
+      // they take, so it's named that instead of "context length"; the
+      // tooltip carries the why. A models.user.ini `ctx-size` wins, as it
+      // does in the server.
+      let overridden = UserModelOverrides.overriddenCtxSize(for: model.id)
       let limit =
-        UserModelOverrides.overriddenCtxSize(for: model.id).map(Format.ctxOverride)
+        overridden.map(Format.ctxOverride)
         ?? model.effectiveCtxTier?.shortLabel ?? ContextTier.k4.shortLabel
-      mainStack.addArrangedSubview(makeInfoLabel("Accepts inputs up to \(limit) tokens"))
+      let source =
+        overridden != nil
+        ? "Set in \(UserModelOverrides.filename)."
+        : """
+          Fixed for models that don't chat: their inputs are short, and a \
+          higher limit would only use more memory. Raise it with ctx-size \
+          in \(UserModelOverrides.filename).
+          """
+      mainStack.addArrangedSubview(
+        makeHeaderRow(
+          label: "Max input", detail: "\(limit) tokens",
+          infoDescription: "What is max input?",
+          toolTip: """
+            The longest input this model accepts -- a longer one is rejected.
+
+            \(source)
+            """))
     } else if model.ctxBytesPer1kTokens == 0 {
       mainStack.addArrangedSubview(makeInfoLabel("Estimating memory requirements..."))
     } else if model.ctxBytesPer1kTokens < 0 {
@@ -139,50 +205,24 @@ final class ExpandedModelDetailsView: ItemView {
       // length" in the tier labels' tint, "memory use" dimmer like the cost
       // sublabels, so the word-to-line pairing carries the meaning without a
       // separate caption.
-      let header = Theme.secondaryLabel()
-      let headerText = NSMutableAttributedString(
-        string: "Context length",
-        attributes: [
-          .font: Theme.Fonts.secondary,
-          .foregroundColor: Theme.Colors.modelIconTint,
-        ])
-      headerText.append(NSAttributedString(
-        string: " · memory use",
-        attributes: [
-          .font: Theme.Fonts.secondary,
-          .foregroundColor: Theme.Colors.textTertiary,
-        ]))
-      header.attributedStringValue = headerText
+      //
+      // Its `?` answers the recurring newcomer question of what picking a size
+      // actually does -- without changing the "Context length" term itself
+      // (renaming would only confuse the many users who already know it). The
+      // tooltip carries the honest answer to all three things people ask: the
+      // memory is reserved on load, it's a hard ceiling, and bigger costs more.
+      mainStack.addArrangedSubview(
+        makeHeaderRow(
+          label: "Context length", detail: "memory use",
+          infoDescription: "What is context length?",
+          toolTip: """
+            How much of the conversation the model can remember at once. Bigger \
+            sizes remember more, but use more memory and run a little slower.
 
-      // A `?` next to the header answers the recurring newcomer question of
-      // what picking a size actually does -- without changing the "Context
-      // length" term itself (renaming would only confuse the many users who
-      // already know it). The tooltip carries the honest answer to all three
-      // things people ask: the memory is reserved on load, it's a hard ceiling,
-      // and bigger costs more. Hover-only, so it's invisible to those who
-      // already understand it. A tooltip (not an NSPopover) because this view is
-      // hosted in the menu, whose event tracking a popover would fight.
-      let info = NSImageView(
-        image: NSImage(
-          systemSymbolName: "questionmark.circle",
-          accessibilityDescription: "What is context length?") ?? NSImage())
-      info.contentTintColor = Theme.Colors.textTertiary
-      info.symbolConfiguration = .init(pointSize: 11, weight: .regular)
-      info.toolTip = """
-        How much of the conversation the model can remember at once. Bigger \
-        sizes remember more, but use more memory and run a little slower.
-
-        The memory shown is reserved while the model is loaded. Once a \
-        conversation grows past the limit, it no longer fits -- you'll need a \
-        larger size or a fresh conversation.
-        """
-
-      // Header text and the `?` on one line, left-aligned and snug together.
-      let headerRow = NSStackView(views: [header, info])
-      headerRow.orientation = .horizontal
-      headerRow.alignment = .centerY
-      headerRow.spacing = 4
-      mainStack.addArrangedSubview(headerRow)
+            The memory shown is reserved while the model is loaded. Once a \
+            conversation grows past the limit, it no longer fits -- you'll need a \
+            larger size or a fresh conversation.
+            """))
       mainStack.addArrangedSubview(picker)
       // The picker spans the full content width, with segments sharing it
       // equally (fillEqually above) so the costs read as a table column.
@@ -196,7 +236,14 @@ final class ExpandedModelDetailsView: ItemView {
     }
 
     contentView.addSubview(mainStack)
-    mainStack.pinToSuperview(top: 4, leading: 0, trailing: 0, bottom: 6)
+    // A lone line (no picker under it) sits snug under the title and just
+    // above the separator, so it reads as part of the header block; with
+    // the picker's usual insets it floated halfway between the two.
+    if model.kind != .chat {
+      mainStack.pinToSuperview(top: 1, leading: 0, trailing: 0, bottom: 0)
+    } else {
+      mainStack.pinToSuperview(top: 4, leading: 0, trailing: 0, bottom: 6)
+    }
 
     // Pin to the standard menu width so a long label (e.g. the "Could not estimate
     // memory" fallback) can't widen the whole menu beyond what model rows use.

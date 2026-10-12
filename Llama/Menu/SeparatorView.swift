@@ -4,12 +4,14 @@ import AppKit
 final class SeparatorView: NSView {
   private let line = NSView()
 
-  init() {
+  /// `height` is the whole item, the hairline centered in it. 12 matches the
+  /// list's density; a model page passes `pageHeight`, since its few rows sit
+  /// in roomier sections.
+  init(height: CGFloat = 12) {
     super.init(frame: .zero)
     translatesAutoresizingMaskIntoConstraints = false
 
-    // Match standard menu item height or slightly less for separator
-    heightAnchor.constraint(equalToConstant: 12).isActive = true
+    heightAnchor.constraint(equalToConstant: height).isActive = true
     widthAnchor.constraint(equalToConstant: Layout.menuWidth).isActive = true
 
     line.translatesAutoresizingMaskIntoConstraints = false
@@ -29,6 +31,11 @@ final class SeparatorView: NSView {
       line.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -padding),
     ])
   }
+
+  /// Separator height on a model page: 4pt more breathing room around each
+  /// hairline than the list's, so the page's sections (header, actions,
+  /// footer) read as separate blocks rather than one run of rows.
+  static let pageHeight: CGFloat = 16
 
   required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 

@@ -67,7 +67,9 @@ final class ModelPageHeaderView: ItemView {
     row.alignment = .centerY
     row.spacing = 6
     contentView.addSubview(row)
-    row.pinToSuperview(top: 4, leading: 0, trailing: 0, bottom: 4)
+    // No top inset: the back row above is already 28pt tall, and extra air
+    // there pushed the title down, away from what it heads.
+    row.pinToSuperview(top: 0, leading: 0, trailing: 0, bottom: 4)
 
     widthAnchor.constraint(equalToConstant: Layout.menuWidth).isActive = true
     titleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
