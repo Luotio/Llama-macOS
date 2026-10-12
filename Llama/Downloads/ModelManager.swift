@@ -538,8 +538,23 @@ class ModelManager: NSObject, URLSessionDataDelegate {
       // llama-server only serves `/v1/embeddings` for a model started with
       // `--embeddings`. The flag also restricts the instance to embedding
       // (it can't generate), which is all an embedding model does anyway.
+      //
+      // Embedding models attend in both directions, so llama.cpp has to take
+      // each input in one batch: the longest input it accepts is the batch
+      // size, not the context ("input is too large to process. increase the
+      // physical batch size"). Left at the defaults that's 512 tokens (2048
+      // with the large ubatch above), well under the context. Sizing both
+      // batches to the context makes the context the real input limit. It
+      // costs memory -- EmbeddingGemma 2 measured ~1 GB at 4k, ~2 GB at 8k --
+      // so the context stays at its default instead of the model's full
+      // window (the model page has no picker for it -- see
+      // `MenuController.addModelPage`). A `ctx-size` in models.user.ini is
+      // followed, so raising it there raises the input limit with it.
       if model.kind == .embedding {
         section.set("embeddings", "true")
+        let ctx = UserModelOverrides.overriddenCtxSize(for: model.id) ?? "\(tier.rawValue)"
+        section.set("batch-size", ctx)
+        section.set("ubatch-size", ctx)
       }
 
       // Names the user pointed at this model in Settings > Aliases.
