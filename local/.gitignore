@@ -1,0 +1,7 @@
+# model weights: multi-GB, never commit (root .gitignore also has *.gguf)
+models/*.gguf
+
+# benchmark run artifacts
+bench/results/
+
+__pycache__/
