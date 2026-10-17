@@ -1,4 +1,4 @@
-# Qwen3.8-27B (UD-Q4_K_XL) performance results
+# Qwen3.8-27B and Qwen3.8-Flash-Next performance results
 
 Machine: 64 threads (AVX2 only, no AVX512), 109 GB RAM, 1x Tesla V100-SXM2-16GB
 usable + 1x GTX 1080 (8 GB) as temporary layer host. The second V100 is faulty
@@ -176,3 +176,91 @@ generated tokens with mixed context lengths and prefix-cache reuse, so they
 are not directly comparable to our cold pp512/tg128 llama-bench numbers.
 The decode gap (45 vs 10.3) is expected: all-GPU vs 21 CPU layers per token
 over a Gen3 x8 link.
+
+# Qwen3.8-Flash-Next (qwen4exp, 125B MoE / 6B active) on this box
+
+Model: `local/models/Qwen3.8-Flash-Next-UD-IQ4_XS-*.gguf` (93.7 GB, 3 shards)
+plus a self-contained MTP sidecar (4.14 GB Q8_0). Architecture: hidden 2560,
+vocab 248320, 48 layers of 12 x (3x Gated DeltaNet -> MoE, 1x QSA -> MoE),
+MoE = 512 experts / 10 routed + 1 shared, plus a 51 GB n-gram PLE table.
+
+llama.cpp recipe (single healthy V100, everything else in system RAM):
+`--n-cpu-moe 999 -ot 'per_layer_token_embd=CPU' --moe-cache-mib 2048`, KV q8_0
+except noted. The MoE experts and the PLE table stay on CPU; only attention,
+shared experts and embeddings touch the GPU.
+
+## llama-bench sweep (stopped early by user)
+
+Single healthy V100, pp512/tg128, reps=3, FA on. Sweep was killed mid-run at
+the user's request ("stop it"); the q4-KV and no-FA variants at 128k were NOT
+run.
+
+| label | ctx | KV | pp512 t/s | tg128 t/s | start temp C |
+|---|---|---|---|---|---|
+| fn-smoke | 4096 | q8_0 | 60.48 (pp256) | 13.41 (tg64) | - |
+| fn-32k | 32768 | q8_0 | 81.04 | 13.08 | 54 |
+| fn-64k | 65536 | q8_0 | 77.24 | 12.18 | 80 |
+| fn-128k | 131072 | q8_0 | 64.17 | 10.87 | 82 |
+
+Notes:
+- Prompt rate peaks around 32k and falls at longer context (KV traffic).
+- Decode is remarkably stable: 13.4 -> 10.9 t/s from 4k to 128k, because the
+  per-token cost is dominated by CPU expert traffic, not KV length.
+- GPU stays under the 85 C throttle threshold (max 82 C at start of fn-128k).
+- Raw data: local/bench/results/bench.csv + fn-*.jsonl.
+
+MTP server test (serve-qwen38-flash-next.sh, port 8095, ctx 131072, KV q4_0,
+spec draft-mtp with the self-contained sidecar) is still pending; see
+local/bench/mtp-bench.py --label fn-mtp.
+
+# Strata (Niko1221/Strata v0.1.45) on this box
+
+Strata is a purpose-built engine for Flash-Next class MoE models: dense layers
+on the GPU, all 512 experts streamed from system RAM over PCIe per token,
+MTP speculative decoding built in. Setup: `strata/setup.sh --family unsloth
+--model UD-IQ4_XS --gguf-dir local/models --gpu 2 --context 65536` (reuses our
+93.7 GB shards, SHA-256 verified; fetches only the ~5 GB MTP draft layer).
+
+V100 is EXPERIMENTAL in Strata: CUDA 13 dropped sm_70, so setup compiled a
+second engine into `strata/engine-cuda12/` with `-DSTRATA_EXPERIMENTAL_SM60=ON`
+(auto-selected because the chosen card is below sm_75). Host compiler must be
+gcc-14 (`export CC=gcc-14 CXX=g++-14`) because nvcc 12.9 rejects gcc 15.
+
+Config: `--gpu 2` (healthy V100; the default "most VRAM" pick ties between both
+V100s and could grab the faulty one), ctx 65536 (KV int8 at 128k would be
+~138 GB), KV streaming on (KV lives in RAM, 0.9 GB), `--spec 4 --spec-min-p
+0.5`, MTP draft from Strata-data/mtp/rt (experts q2_0).
+
+## Quick test (no long benchmarks, per user request)
+
+Server load: ~55 s to ready, 485 MiB VRAM free with everything loaded.
+One small completion + one ~432-token prompt, MTP on.
+
+| metric | value | docs expectation (V100) |
+|---|---|---|
+| prompt t/s (432 tok) | 136.0 | ~1,100-1,250 |
+| decode t/s (MTP spec=4) | 24.3 | 38-51 |
+| MTP draft acceptance | 13/13 (long), 6/9 + 3/3 (small) | - |
+| model load time | ~55 s | - |
+
+The rates are far below the docs' V100 numbers. Root cause is the PCIe link:
+the engine's own probe measured only 5.6 GB/s host->device (pcie_frac 0.16,
+default 0.55), and nvidia-smi shows BOTH V100s at Gen3 x8 (8 of 16 lanes).
+Strata streams all 512 experts from RAM per token, so it is directly bound by
+that link; the docs assume a full-width link. The GTX 1080 also reads Gen1 x16
+(59 C at idle) - this box's PCIe slots appear to be the bottleneck for any
+RAM-streaming engine.
+
+Comparison on the same card, same model (llama.cpp vs Strata):
+
+| metric | llama.cpp (fn-32k) | Strata (quick test) |
+|---|---|---|
+| prompt t/s | 81.04 (pp512 @32k) | 136.0 (432 tok) |
+| decode t/s | 13.08 (tg128, no MTP) | 24.3 (MTP spec=4) |
+
+Strata is ~1.7x faster on prompt and ~1.9x on decode despite the crippled
+link, mostly from its expert-streaming pipeline + built-in MTP. llama.cpp's
+decode here has no speculative decoding in the bench numbers.
+
+Start/stop: `cd strata && ./run-unsloth-ud-iq4_xs.sh` (port 8080, OpenAI API).
+Stop with `pkill -f "strata/serve/server.py"; pkill -f engine-cuda12`.
