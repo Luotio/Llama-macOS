@@ -12,7 +12,7 @@ Repo root: `/mnt/git/local-llama-cpp`. Goal: fast local inference for coding wor
 | `local/bench/` | benchmark scripts + `RESULTS.md` (all recorded numbers live here) |
 | `local/strata/` | Strata server config (`*.json`) + run script — tracked, edit here |
 | `local/serve-qwen38-flash-next.sh` | llama.cpp server launcher (port 8095, MTP sidecar) |
-| `strata/` | **embedded upstream clone** (Niko1221/Strata v0.1.45), gitignored, has its own `.git`. Prebuilt engine at `strata/engine-cuda12/strata`. Never commit inside it; put local config/scripts in `local/strata/` instead |
+| `strata/` | **tracked private fork** of Niko1221/Strata (fork base v0.1.45, upstream commit 477ac13c). Prebuilt engine at `strata/engine-cuda12/strata` (gitignored; rebuild via setup.sh). Edits here are normal commits to this repo; build artifacts stay out via `strata/.gitignore`. Local server config/scripts live in `local/strata/` |
 | `Strata-data/` | untracked runtime data: `packs/` (model pack + tokenizer), `mtp/rt` (MTP draft) |
 
 ## Machine facts (read before touching anything performance-related)
@@ -54,6 +54,10 @@ curl -s http://127.0.0.1:8080/health   # poll until "loaded":true (~55 s)
 - Key env in config: `STRATA_SM70_TABLE=1` (opt-in Volta decode kernels, bitwise-identical output, ~+10-15% decode), `STRATA_HC_Q8=1`, `STRATA_ROUTE_TAIL_SKIP=0`.
 - Key args: `--prefill auto:32768`, `--max-context 131072` (KV streaming, int8, kv-resident 32768; 131k costs only ~0.8 GiB extra RAM), `--conversation-cache-mib 8192` (prefix reuse across agent turns), `--spec 4 --spec-min-p 0.5 --mtp .../Strata-data/mtp/rt`, `--expert-cache auto`.
 - Engine build: `strata/engine-cuda12/`, Release/-O3, CUDA arch 70, `STRATA_EXPERIMENTAL_SM60=ON`. Already optimally configured; don't rebuild casually.
+
+### VS Code Copilot integration (delft-solutions.llama-copilot)
+
+The extension speaks llama-server's NATIVE protocol, not OpenAI paths. The fork's serve layer adds the endpoints it calls on every request: `POST /apply-template` (render the chat template only), `POST /tokenize`, and `POST /infill` (answered with empty content on purpose - a reasoning model is no good at inline ghost text). Chat itself goes to `/v1/chat/completions`. Settings: endpoint `local` = `http://127.0.0.1:8080`; the model appears as `qwen3.8-flash-next-unsloth-ud-iq4_xs@local`. Note: the server injects a "Reasoning effort is set to ..." system message (upstream EFFORT_TEXT feature; per-request `reasoning_effort` or config-level default).
 
 ## Running llama.cpp (comparison / fallback)
 
