@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build llama.cpp with the CUDA backend for 2x V100-SXM2-16GB (sm_70).
+# Build llama.cpp with the CUDA backend for 2x V100-SXM2-16GB (sm_70)
+# plus the GTX 1080 (sm_61, temporary layer host while one V100 is in RMA).
 #
 # One-time prerequisite (run with sudo):
 #   emerge --ask dev-util/nvidia-cuda-toolkit=12.9.1-r1
@@ -30,7 +31,7 @@ cmake -B "$BUILD_DIR" -S "$REPO_ROOT" \
     -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
     "${HOST_FLAGS[@]}" \
     -DGGML_CUDA=ON \
-    -DCMAKE_CUDA_ARCHITECTURES="70-real" \
+    -DCMAKE_CUDA_ARCHITECTURES="61-real;70-real" \
     -DGGML_CUDA_GRAPHS=ON
 
 cmake --build "$BUILD_DIR" --config Release -j "$JOBS" \

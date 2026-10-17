@@ -28,7 +28,8 @@ UBATCH="${UBATCH:-512}"
 CT_K="${CT_K:-q8_0}"
 CT_V="${CT_V:-q8_0}"
 NGL="${NGL:-all}"
-TS="${TS:-1,1}"
+# llama.cpp tensor split uses '/' between devices (comma is parsed as one number)
+TS="${TS:-1/1}"
 FA="${FA:-on}"
 DELAY="${DELAY:-2}"
 
