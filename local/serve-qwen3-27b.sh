@@ -9,8 +9,10 @@
 # Usage:
 #   local/serve-qwen3-27b.sh [path/to/model.gguf]
 #
-# Env overrides: MODEL HOST PORT CTX TENSOR_SPLIT CACHE_K CACHE_V
-#                DRAFT_MAX PARALLEL CACHE_REUSE CUDA_VISIBLE_DEVICES
+# Env overrides: MODEL HOST PORT CTX NGL TENSOR_SPLIT CACHE_K CACHE_V
+#                SPEC_TYPE DRAFT_MAX PARALLEL CACHE_REUSE CUDA_VISIBLE_DEVICES
+#   NGL=all (default) puts every layer on GPU; NGL=auto lets llama.cpp fit
+#   layers to free VRAM and offload the rest to CPU (single-GPU mode).
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -20,9 +22,11 @@ MODEL="${1:-${MODEL:-$REPO_ROOT/local/models/Qwen3.8-27B-UD-Q4_K_XL.gguf}}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8080}"
 CTX="${CTX:-131072}"
+NGL="${NGL:-all}"
 TENSOR_SPLIT="${TENSOR_SPLIT:-1,1}"
 CACHE_K="${CACHE_K:-q8_0}"
 CACHE_V="${CACHE_V:-q8_0}"
+SPEC_TYPE="${SPEC_TYPE:-draft-mtp}"
 DRAFT_MAX="${DRAFT_MAX:-3}"
 PARALLEL="${PARALLEL:-1}"
 CACHE_REUSE="${CACHE_REUSE:-256}"
@@ -36,20 +40,20 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-$V100_UUIDS}"
 [[ -f "$MODEL" ]]  || { echo "error: model not found: $MODEL (pass path as \$1 or set MODEL)" >&2; exit 1; }
 
 echo "model  : $MODEL"
-echo "gpus   : $CUDA_VISIBLE_DEVICES (tensor split $TENSOR_SPLIT)"
+echo "gpus   : $CUDA_VISIBLE_DEVICES (tensor split $TENSOR_SPLIT, ngl $NGL)"
 echo "ctx    : $CTX, KV cache K=$CACHE_K V=$CACHE_V"
-echo "mtp    : draft-mtp, n_max=$DRAFT_MAX"
+echo "spec   : type=$SPEC_TYPE, n_max=$DRAFT_MAX"
 echo "listen : http://$HOST:$PORT"
 
 exec "$SERVER" \
     -m "$MODEL" \
     -c "$CTX" \
-    -ngl all \
+    -ngl "$NGL" \
     -ts "$TENSOR_SPLIT" \
     -fa on \
     -ctk "$CACHE_K" \
     -ctv "$CACHE_V" \
-    --spec-type draft-mtp \
+    --spec-type "$SPEC_TYPE" \
     --spec-draft-n-max "$DRAFT_MAX" \
     --jinja \
     --cache-reuse "$CACHE_REUSE" \
