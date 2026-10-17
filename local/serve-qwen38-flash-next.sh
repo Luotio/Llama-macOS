@@ -18,7 +18,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SERVER="$REPO_ROOT/build/bin/llama-server"
+SERVER="$REPO_ROOT/llama-cpp/build/bin/llama-server"
 
 # sharded GGUF: pass the first shard, llama.cpp loads the rest automatically
 MODEL="${1:-${MODEL:-$REPO_ROOT/local/models/Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf}}"

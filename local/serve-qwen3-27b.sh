@@ -18,7 +18,7 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-SERVER="$REPO_ROOT/build/bin/llama-server"
+SERVER="$REPO_ROOT/llama-cpp/build/bin/llama-server"
 
 MODEL="${1:-${MODEL:-$REPO_ROOT/local/models/Qwen3.8-27B-UD-Q4_K_XL.gguf}}"
 HOST="${HOST:-0.0.0.0}"

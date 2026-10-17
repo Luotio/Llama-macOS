@@ -16,7 +16,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 BENCH_DIR="$REPO_ROOT/local/bench"
 RESULTS_DIR="$BENCH_DIR/results"
 CSV="$RESULTS_DIR/bench.csv"
-BIN="$REPO_ROOT/build/bin/llama-bench"
+BIN="$REPO_ROOT/llama-cpp/build/bin/llama-bench"
 
 MODEL="${MODEL:-$REPO_ROOT/local/models/Qwen3.8-27B-UD-Q4_K_XL.gguf}"
 DEPTH="${DEPTH:-131072}"

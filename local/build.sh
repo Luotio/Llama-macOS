@@ -9,7 +9,8 @@
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/build}"
+SRC_ROOT="$REPO_ROOT/llama-cpp"   # llama.cpp lives in a subtree since the reorg
+BUILD_DIR="${BUILD_DIR:-$REPO_ROOT/llama-cpp/build}"
 JOBS="${JOBS:-$(nproc)}"
 
 CUDA_HOME="${CUDA_HOME:-/opt/cuda}"
@@ -26,7 +27,7 @@ if command -v g++-14 >/dev/null 2>&1; then
     HOST_FLAGS=(-DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 -DCMAKE_CUDA_HOST_COMPILER=g++-14)
 fi
 
-cmake -B "$BUILD_DIR" -S "$REPO_ROOT" \
+cmake -B "$BUILD_DIR" -S "$SRC_ROOT" \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_CUDA_COMPILER="$CUDA_HOME/bin/nvcc" \
     "${HOST_FLAGS[@]}" \
