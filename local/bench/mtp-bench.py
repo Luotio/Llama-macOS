@@ -80,7 +80,7 @@ def main() -> int:
     results = []
     for i in range(args.reps):
         try:
-            r = one_request(args.url, max_tokens, SYSTEM, prompts[i % len(prompts)])
+            r = one_request(args.url, args.max_tokens, SYSTEM, prompts[i % len(prompts)])
         except Exception as e:  # noqa: BLE001 - report and continue
             print(f"rep {i}: FAILED: {e}", file=sys.stderr)
             break

@@ -9,6 +9,13 @@
 > [!NOTE]
 > These apply to ggml-org/llama.cpp, ignore these if you are operating in a different repository or fork.
 
+> [!NOTE]
+> This workspace is a **fork** of llama.cpp (local-llama-cpp). Machine-specific
+> setup, build scripts and benchmarking notes for the local 2x V100 box live
+> in the `local/` folder: start with `local/README.md`, hardware layout and
+> GPU diagnostics are in `local/HARDWARE.md`, benchmark results in
+> `local/bench/RESULTS.md`. Nothing in `local/` modifies upstream source.
+
 ---
 
 ## Guidelines for Contributors

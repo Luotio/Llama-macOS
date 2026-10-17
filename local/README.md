@@ -9,8 +9,7 @@ Model weights and benchmark results are gitignored (see local/.gitignore).
 | nvidia-smi index | Card            | Role                                    |
 |------------------|-----------------|-----------------------------------------|
 | 0                | GTX 1080        | desktop display (X/KDE), never use     |
-| 1                | V100-SXM2-16GB  | inference                               |
-| 2                | V100-SXM2-16GB  | inference                               |
+| 1, 2             | V100-SXM2-16GB  | inference (one of them is faulty, see below) |
 
 WARNING: CUDA device indices do NOT match nvidia-smi indices on this box.
 CUDA sees the V100s as devices 0 and 1 and the GTX 1080 as device 2, so a
@@ -18,11 +17,14 @@ naive `CUDA_VISIBLE_DEVICES=1,2` would pull the desktop GPU into the tensor
 split. All scripts therefore address the V100s by UUID, which both CUDA and
 nvidia-smi accept:
 
-    GPU-40faaa73-acef-a2eb-1f38-7b96df067d5c   (V100, PCI 81:00.0)
-    GPU-f07f3af3-5f02-f364-0d37-2ab3a4c4afce   (V100, PCI 82:00.0)
+    GPU-40faaa73-acef-a2eb-1f38-7b96df067d5c   (V100, HEALTHY, in use)
+    GPU-f07f3af3-5f02-f364-0d37-2ab3a4c4afce   (V100, FAULTY, RMA pending - do not use)
 
 PCI bus ID strings (full and short form) were tried for
 CUDA_VISIBLE_DEVICES and yielded no devices; UUIDs are the reliable form.
+PCI addresses change when a card is reseated, so they are not listed here;
+see HARDWARE.md for the physical layout, the faulty-card evidence, and
+diagnostic commands.
 
 ## Step 1: install CUDA toolkit (user runs, needs sudo)
 

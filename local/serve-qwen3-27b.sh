@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Serve Qwen3.8-27B (UD-Q4_K_XL) on 2x V100-SXM2-16GB for coding-agent workloads.
+# Serve Qwen3.8-27B (UD-Q4_K_XL) on one V100-SXM2-16GB for coding-agent workloads.
 #
-#   - 128k context, all layers on GPU, tensor split across both V100s
-#   - MTP speculative decoding (--spec-type draft-mtp, module lives in the GGUF)
-#   - quantized KV cache so 128k fits into 32GB total VRAM
-#   - flash attention on
+#   - 128k context, NGL=45 layers on GPU (server ceiling; 47+ OOMs with the
+#     MTP draft context), rest on CPU
+#   - MTP speculative decoding (--spec-type draft-mtp, n_max=3: best in bench,
+#     see local/bench/RESULTS.md)
+#   - q4_0 KV cache so 128k fits into 16GB VRAM
+#   - flash attention on (required for quantized KV in this build)
 #
 # Usage:
 #   local/serve-qwen3-27b.sh [path/to/model.gguf]
@@ -22,18 +24,20 @@ MODEL="${1:-${MODEL:-$REPO_ROOT/local/models/Qwen3.8-27B-UD-Q4_K_XL.gguf}}"
 HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8080}"
 CTX="${CTX:-131072}"
-NGL="${NGL:-all}"
-TENSOR_SPLIT="${TENSOR_SPLIT:-1,1}"
-CACHE_K="${CACHE_K:-q8_0}"
-CACHE_V="${CACHE_V:-q8_0}"
+NGL="${NGL:-45}"
+TENSOR_SPLIT="${TENSOR_SPLIT:-1}"
+CACHE_K="${CACHE_K:-q4_0}"
+CACHE_V="${CACHE_V:-q4_0}"
 SPEC_TYPE="${SPEC_TYPE:-draft-mtp}"
 DRAFT_MAX="${DRAFT_MAX:-3}"
 PARALLEL="${PARALLEL:-1}"
 CACHE_REUSE="${CACHE_REUSE:-256}"
 
-# Address the V100s by UUID: CUDA device indices do NOT match nvidia-smi
+# Address the GPU by UUID: CUDA device indices do NOT match nvidia-smi
 # indices on this box (numeric 1,2 would pull in the desktop GTX 1080).
-V100_UUIDS="GPU-40faaa73-acef-a2eb-1f38-7b96df067d5c,GPU-f07f3af3-5f02-f364-0d37-2ab3a4c4afce"
+# Default is the single healthy V100; the second card is faulty (RMA pending,
+# see local/HARDWARE.md) and must not be used.
+V100_UUIDS="GPU-40faaa73-acef-a2eb-1f38-7b96df067d5c"
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-$V100_UUIDS}"
 
 [[ -x "$SERVER" ]] || { echo "error: $SERVER not found, run local/build.sh first" >&2; exit 1; }
