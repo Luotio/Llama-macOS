@@ -2,7 +2,6 @@
 
 /build
 /Strata-data/
-/strata/
 local/models/*.done
 local/models/download-*.log
 local/strata/*.log
