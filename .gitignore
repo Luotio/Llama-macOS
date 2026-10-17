@@ -1,4 +1,8 @@
 # Root-level ignores (llama.cpp's own .gitignore lives in llama-cpp/)
 
-build
-Strata-data/
+/build
+/Strata-data/
+/strata/
+local/models/*.done
+local/models/download-*.log
+local/strata/*.log
