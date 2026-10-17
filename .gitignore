@@ -1,0 +1,4 @@
+# Root-level ignores (llama.cpp's own .gitignore lives in llama-cpp/)
+
+build
+Strata-data/
