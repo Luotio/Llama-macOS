@@ -25,9 +25,11 @@ Repo root: `/mnt/git/local-llama-cpp`. Goal: fast local inference for coding wor
 
 | UUID | Card | nvidia-smi index | NUMA node | Status |
 |---|---|---|---|---|
-| `GPU-40faaa73-acef-a2eb-1f38-7b96df067d5c` | V100 16 GB (sm_70) | 2 | **node 1** | **HEALTHY — the one to use** |
-| `GPU-f07f3af3-5f02-f364-0d37-2ab3a4c4afce` | V100 16 GB | 1 | node 1 | **FAULTY (RMA) — NEVER use** |
+| `GPU-40faaa73-acef-a2eb-1f38-7b96df067d5c` | V100 16 GB (sm_70) | 1 | **node 1** | **HEALTHY — the one to use** |
+| `GPU-f07f3af3-5f02-f364-0d37-2ab3a4c4afce` | V100 16 GB | 2 | node 1 | **FAULTY (RMA) — NEVER use** |
 | `GPU-6f4fedec-c775-e942-f39d-bd77cf3f3384` | GTX 1080 8 GB (sm_61) | 0 | node 0 | works, small |
+
+(Indices re-verified 2026-10-18 after the two V100s were swapped between slots; UUIDs follow the physical modules.)
 
 Driver 580.126.18. **PCIe link limit**: the healthy V100 is wired at Gen3 x8 (~5.6 GB/s measured host→device). This caps expert streaming — Strata rates on this box will be below what the upstream docs assume for full-width links; that is hardware, not a bug.
 
@@ -49,7 +51,7 @@ curl -s http://127.0.0.1:8080/health   # poll until "loaded":true (~55 s)
 ```
 
 - OpenAI-compatible API at `http://127.0.0.1:8080/v1`.
-- Config: `local/strata/strata-unsloth-ud-iq4_xs.json` (args, env, gpu index 2). Log: `local/strata/strata-unsloth-ud-iq4_xs.log`.
+- Config: `local/strata/strata-unsloth-ud-iq4_xs.json` (args, env, gpu index 1). Log: `local/strata/strata-unsloth-ud-iq4_xs.log`.
 - Stop: `pkill -f "strata/serve/server.py"; pkill -f engine-cuda12` — the Python wrapper can survive an engine crash, so kill both.
 - Key env in config: `STRATA_SM70_TABLE=1` (opt-in Volta decode kernels, bitwise-identical output, ~+10-15% decode), `STRATA_HC_Q8=1`, `STRATA_ROUTE_TAIL_SKIP=0`.
 - Key args: `--prefill auto:32768`, `--max-context 131072` (KV streaming, int8, kv-resident 32768; 131k costs only ~0.8 GiB extra RAM), `--conversation-cache-mib 8192` (prefix reuse across agent turns), `--spec 4 --spec-min-p 0.5 --mtp .../Strata-data/mtp/rt`, `--expert-cache auto`.
