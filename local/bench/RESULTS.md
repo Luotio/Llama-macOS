@@ -264,3 +264,142 @@ decode here has no speculative decoding in the bench numbers.
 
 Start/stop: `cd strata && ./run-unsloth-ud-iq4_xs.sh` (port 8080, OpenAI API).
 Stop with `pkill -f "strata/serve/server.py"; pkill -f engine-cuda12`.
+
+## Real agent workload (VS Code Copilot via llama-copilot extension), 2026-10-17
+
+First sustained real-world run: a coding agent driving the local endpoint
+(http://127.0.0.1:8080) through the delft-solutions.llama-copilot extension.
+Snapshot from GET /metrics after 24 chat requests (~89 min server uptime),
+captured mid-generation (live request at 70,069 prompt tokens). Same tuned
+config as above (--spec 4 --spec-min-p 0.5 + MTP, prefill auto:32768, ctx
+131072 int8 KV, kv-resident 32768, conv-cache 8192 MiB, expert-cache auto,
+STRATA_SM70_TABLE=1, numactl node 1).
+
+| metric | value |
+|---|---|
+| requests since start | 24 (22/24 hit the conversation cache) |
+| prompt tokens total | 1,282,271 (91.3% reused from conv-cache) |
+| output tokens total | 26,879 |
+| decode t/s (mean over all requests) | 28.6 (per-request range 25.3-34.2) |
+| MTP draft acceptance | 14,854/23,487 = 63.2% overall (per request 59-84%) |
+| conv-cache state | 6.75 GB parked in 4 slots, 5 parks, 1 eviction, 0 restores |
+| live session at snapshot | 70,069 prompt tok, 6,846 generated in 257.7 s = 23.3 t/s (2 s window), 27.8 mean |
+
+Cached-prompt prefill: a request with 67,380 prompt tokens (65,475 reused)
+took 10.9 s of prefill (~6.2k tok/s over the full context with KV resident)
+vs 136 t/s cold at 432 tokens in the quick test. The engine reports spec=6
+(mtp_max 4 + lookup 3) in /metrics for the --spec 4 config.
+
+Hardware during load:
+
+| metric | value |
+|---|---|
+| GPU util / temp | 100% / 82-84 C (no throttle; power 80-157 W of a 300 W limit) |
+| VRAM | 15.8/16 GiB (485 MiB free) |
+| PCIe rx (expert streaming) | bursts to ~8 GB/s, typical ~2.3 GB/s (Gen3 x8 link) |
+| CPU | 52-64% of 32 cores (node 1 bound) |
+| RAM | 98.3/118 GiB (model + expert cache 8.5 GiB + conv-cache 8 GiB) |
+
+Takeaways:
+- Decode under real agent traffic (28.6 t/s mean) is ~1.2x the quick-test
+  number (24.3 t/s); long cached prompts keep prefill cheap and MTP acceptance
+  stays healthy at 63%.
+- The conversation cache is doing its job: 91% of all prompt tokens were
+  reused, so agent turns mostly pay for the delta + attention over resident KV.
+- GPU never nears the power limit; the box is PCIe/DRAM-bound, not thermally
+  bound (82 C at full load).
+
+## A/B test of three decode optimizations + numad/NUMA findings, 2026-10-17
+
+Probe: deterministic agent-style request (temperature=0), 37,258 prompt tokens
+(payment-service prose, ~260 blocks), max_tokens=2000, stream=false, via
+/v1/chat/completions. Server-side numbers from /metrics requests[]
+(decode_tok_s, prompt_ms, hit_rate, drafts). Caveat: an earlier probe version
+omitted temperature (API default 1.0), so those runs generated different
+content each time and their decode comparisons were invalid; all numbers below
+use temperature=0.
+
+### Phase 1: three-item A/B (numad still active -- later found confounded)
+
+Baseline config: spec-min-p 0.5, expert-cache auto, no pool-workers flag.
+
+| arm | change | decode t/s (cold) | drafts offered / 2000 tok | draft acceptance | expert hit |
+|---|---|---|---|---|---|
+| baseline | - | 31.2 | 1,634 | 63.5% (1,038) | 69.9% |
+| #1 | spec-min-p 0.3 | 25.7 (warm: 26.3) | 2,033 (warm: 1,995) | 47.9% (warm: 49.5%) | 72.4% |
+| #3 | pool-workers 16 | 27.2 | - | - | - |
+
+- #1 spec-min-p 0.3: REJECTED. The lower threshold lets the MTP drafter extend
+  windows on low-confidence guesses: +25% drafts offered, but acceptance
+  collapses 63.5% -> ~48%, tokens per verify step drops 1.22 -> 0.98, decode
+  -18%. Reverted to 0.5.
+- #2 expert-cache grow (auto -> 16 GiB): INFEASIBLE on this 16 GB card.
+  --expert-cache takes a slot count, not MiB, and auto already fills all free
+  VRAM (3,689 slots / 8.30 GiB from the profile's 49,152 ranked experts). Only
+  485 MiB VRAM remains after load; the engine itself warns that below 512 MiB
+  free the driver may page GPU memory to system RAM (#2065).
+- #3 pool-workers: inconclusive in phase 1 (see numad finding); re-tested
+  cleanly in phase 2.
+
+### Phase 2: numad root cause + clean re-measurement
+
+The numad daemon (sys-process/numad-0.5, enabled at boot) was silently applying
+a PID-based policy that relocated the engine's CPU pool to the wrong NUMA node
+across restarts -- pool size flipped between 15 and 31 workers and core
+selection varied, which is what confounded phase 1. numad 0.5 has no
+name-based policy support (PID lists only), so it was disabled instead:
+`rc-update del numad default && rc-service numad stop`.
+
+With numad gone, `numactl --cpunodebind=1` (from the run script) sticks from
+t=0: 15 pool workers on CPUs 17-31 (all node 1), host thread on CPU 16.
+
+Clean deterministic probe (temperature=0, warm conv-cache):
+
+| config | run 1 | run 2 | decode t/s avg | prefill (cold) |
+|---|---|---|---|---|
+| node-1 bound, 15 workers | 30.3 | 29.8 | ~30.0 | 40.4 s (922 t/s) |
+| both nodes, 31 workers | 30.5 | 33.3 | ~31.9 | 38.7 s (964 t/s) |
+
+Run-to-run variance is +/-5% even within one config (greedy output is not
+bit-reproducible: variable draft-acceptance batch shapes feed back into MoE
+routing), so the two configs are statistically indistinguishable. #3 verdict:
+worker count / NUMA binding is NOT a decode bottleneck; keep the default pool.
+
+Prefill after numad removal: 38.4-40.4 s cold (922-971 t/s) vs 61 s (611 t/s)
+in the numad era -- ~1.6x faster and consistent across restarts. Decode sits in
+the same ~30-33 t/s range as the original baseline, so the earlier "decode
+regression" was entirely a temperature-1 sampling artifact.
+
+### NUMA weight placement (accepted as-is)
+
+The 55.43 GiB expert arena lands mostly on node 0 even with the process bound
+to node 1; the split varies per load:
+
+| run | node 0 | node 1 |
+|---|---|---|
+| node-1 bound (earlier) | 45.2 GiB | 13.5 GiB |
+| both nodes | 44.6 GiB | 14.0 GiB |
+| node-1 bound (latest) | 41.3 GiB | 17.7 GiB |
+
+- `numactl --preferred=1` is ignored on this kernel (numa_balancing=1 +
+  first-touch locality; verified with a standalone 6 GiB touch test that gave
+  the same ~40/60 split under plain, --preferred=1, and
+  --cpunodebind=1 --preferred=1).
+- Root cause is capacity, not policy: node 1 has only ~3 GB free at load time,
+  so under the engine's 3.49 GiB/s 6-thread arena load, per-fault reclaim
+  cannot keep up and faults fall back to node 0. `migratepages` moves only
+  ~150 MB (nowhere on node 1 to accept pages).
+- Measured impact on decode: none (node-1-bound vs both-nodes within noise).
+  Consistent with pcie_share at 2-4% of decode time and cross-socket UPI
+  (~25-35 GB/s) being far faster than the Gen3 x8 PCIe link (5.6 GB/s) that
+  actually caps expert streaming. Accepted as-is; only worth revisiting if
+  node 1's free RAM grows at load time.
+
+### Final state
+
+- Config unchanged: local/strata/strata-unsloth-ud-iq4_xs.json is the committed
+  original (spec-min-p 0.5, expert-cache auto, no pool-workers flag).
+- numad disabled (`rc-update del numad default`); the run script's
+  `numactl --cpunodebind=1` now works as documented.
+- Decode ~30-33 t/s, prefill ~920-970 t/s cold, conv-cache reuse working; the
+  box remains PCIe/DRAM-bound per the real-workload section above.
