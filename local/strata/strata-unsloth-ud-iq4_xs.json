@@ -24,9 +24,7 @@
   "--kv-resident",
   "32768",
   "--conversation-cache-mib",
-  "8192",
-  "--vram-reserve-mib",
-    "768"
+  "8192"
  ],
  "cwd": "/mnt/git/local-llama-cpp/strata",
  "tokenizer": "/mnt/git/local-llama-cpp/Strata-data/packs/unsloth-ud-iq4_xs/tokenizer",
