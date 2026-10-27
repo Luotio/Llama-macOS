@@ -24,7 +24,9 @@
   "--kv-resident",
   "32768",
   "--conversation-cache-mib",
-  "8192"
+  "8192",
+  "--vram-reserve-mib",
+  "768"
  ],
  "cwd": "/mnt/git/local-llama-cpp/strata",
  "tokenizer": "/mnt/git/local-llama-cpp/Strata-data/packs/unsloth-ud-iq4_xs/tokenizer",
@@ -39,7 +41,13 @@
  "env": {
   "STRATA_HC_Q8": "1",
   "STRATA_ROUTE_TAIL_SKIP": "0",
-  "STRATA_SM70_TABLE": "1"
+  "STRATA_SM70_TABLE": "1",
+  "STRATA_BF16_TC": "1",
+  "STRATA_PROMPT_ATTN_OLD": "1",
+  "STRATA_ATTN_PRE75": "1",
+  "STRATA_EXP_MODE": "1",
+  "STRATA_MMVQ_IL": "1",
+  "STRATA_GR_FAST": "1"
  },
  "gpu": 1,
  "gpus_asked": true
