@@ -45,7 +45,6 @@
   "STRATA_BF16_TC": "1",
   "STRATA_PROMPT_ATTN_OLD": "1",
   "STRATA_ATTN_PRE75": "1",
-  "STRATA_EXP_MODE": "1",
   "STRATA_MMVQ_IL": "1",
   "STRATA_GR_FAST": "1"
  },

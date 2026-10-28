@@ -133,7 +133,11 @@ env["STRATA_SM70_TABLE"] = sm70
 env["STRATA_BF16_TC"] = bf16
 env["STRATA_PROMPT_ATTN_OLD"] = prompt_old
 env["STRATA_ATTN_PRE75"] = attn_pre75
-env["STRATA_EXP_MODE"] = exp_mode
+if exp_mode:
+    env["STRATA_EXP_MODE"] = exp_mode
+else:
+    env.pop("STRATA_EXP_MODE", None)   # unset = the card's default (mode 8 on a V100 with STRATA_SM70_TABLE=1).
+                                        # NEVER "1": mode 1 is the gfx906 64-lane layout and __trap()s on CUDA
 env["STRATA_MMVQ_IL"] = mmvq
 env["STRATA_GR_FAST"] = gr_fast
 cfg["env"] = env
@@ -233,17 +237,19 @@ PY
 printf "label,decode_tps_avg,decode_tps_med,prompt_tps_avg,prompt_tps_med,draft_accept_rate,draft_n_total,draft_accepted_total\n" > "$SUMMARY_CSV"
 make_prompt
 
+# exp_mode EMPTY = unset (the card's default: mode 8 on a V100 with STRATA_SM70_TABLE=1).
+# Do NOT put "1" in any arm: mode 1 is the gfx906-only 64-lane layout; on CUDA it __trap()s
+# (Xid 43 + sticky "unspecified launch failure" = "verify: layer N never rang", every request dies).
 declare -a ARMS=()
-ARMS+=("baseline|$ENGINE_BASE|1|1|0|1|1|1|1")
-ARMS+=("sm70_table_off|$ENGINE_BASE|0|1|0|1|1|1|1")
-ARMS+=("bf16_tc_off|$ENGINE_BASE|1|0|0|1|1|1|1")
-ARMS+=("prompt_attn_old_on|$ENGINE_BASE|1|1|1|1|1|1|1")
-ARMS+=("attn_pre75_off|$ENGINE_BASE|1|1|0|0|1|1|1")
-ARMS+=("exp_mode_off|$ENGINE_BASE|1|1|0|1|0|1|1")
-ARMS+=("mmvq_il_off|$ENGINE_BASE|1|1|0|1|1|0|1")
-ARMS+=("gr_fast_off|$ENGINE_BASE|1|1|0|1|1|1|0")
+ARMS+=("baseline|$ENGINE_BASE|1|1|0|1||1|1")
+ARMS+=("sm70_table_off|$ENGINE_BASE|0|1|0|1||1|1")
+ARMS+=("bf16_tc_off|$ENGINE_BASE|1|0|0|1||1|1")
+ARMS+=("prompt_attn_old_on|$ENGINE_BASE|1|1|1|1||1|1")
+ARMS+=("attn_pre75_off|$ENGINE_BASE|1|1|0|0||1|1")
+ARMS+=("mmvq_il_off|$ENGINE_BASE|1|1|0|1||0|1")
+ARMS+=("gr_fast_off|$ENGINE_BASE|1|1|0|1||1|0")
 if [[ -x "$ENGINE_AGGR" ]]; then
-    ARMS+=("aggr_binary|$ENGINE_AGGR|1|1|0|1|1|1|1")
+    ARMS+=("aggr_binary|$ENGINE_AGGR|1|1|0|1||1|1")
 fi
 
 for arm in "${ARMS[@]}"; do
