@@ -1,6 +1,8 @@
 {
  "exe": "/mnt/git/local-llama-cpp/strata/engine-cuda12/strata",
  "args": [
+  "--vram-reserve-mib",
+  "768",
   "--pack",
   "/mnt/git/local-llama-cpp/Strata-data/packs/unsloth-ud-iq4_xs",
   "--native",
@@ -24,9 +26,7 @@
   "--kv-resident",
   "32768",
   "--conversation-cache-mib",
-  "8192",
-  "--vram-reserve-mib",
-  "768"
+  "8192"
  ],
  "cwd": "/mnt/git/local-llama-cpp/strata",
  "tokenizer": "/mnt/git/local-llama-cpp/Strata-data/packs/unsloth-ud-iq4_xs/tokenizer",
@@ -40,7 +40,7 @@
  "cuda": 12,
  "env": {
   "STRATA_HC_Q8": "1",
-  "STRATA_ROUTE_TAIL_SKIP": "0",
+  "STRATA_ROUTE_TAIL_SKIP": "1",
   "STRATA_SM70_TABLE": "1",
   "STRATA_BF16_TC": "1",
   "STRATA_PROMPT_ATTN_OLD": "1",

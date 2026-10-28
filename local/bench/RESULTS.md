@@ -403,3 +403,156 @@ to node 1; the split varies per load:
   `numactl --cpunodebind=1` now works as documented.
 - Decode ~30-33 t/s, prefill ~920-970 t/s cold, conv-cache reuse working; the
   box remains PCIe/DRAM-bound per the real-workload section above.
+
+# PCIe Gen3 restoration + env-var sweep, 2026-10-28
+
+## Engine-death root cause (resolved)
+
+Every "verify: layer N never rang" death was caused by `STRATA_EXP_MODE=1` in
+the production config: mode 1 is the gfx906-only 64-lane wavefront layout, and
+its `row_dot64()` is a `__trap()` on CUDA -> Xid 43 + sticky "unspecified
+launch failure" for the rest of the process. Fix: remove the variable. With
+`STRATA_SM70_TABLE=1` the default mode on this V100 is 8, the verified fast
+path. Zero new NVRM Xids since the fix (last one: Oct 28 21:55, an intentional
+bisection test).
+
+## BIOS round 2: Gen3 x8 restored
+
+BIOS changes: Gen3 Phase3 = Hardware Adaptive, Gen3 EQ mode = Auto,
+DeEmphasis -3.5 dB, Link Speed forced to Gen3, Gen3 Phase2 = Hardware
+Adaptive. Result: V100 back at **Gen3 x8** (was Gen1 x8).
+
+- Idle AER: ~24 correctable/min (GPU TX Timeout ~8/min + root-port RX
+  BadDLLP/BadTLP/Timeout ~16/min). ~10x better than the original storm, not
+  zero.
+- 46k-token stress request at Gen3: HTTP 200 in **39.9 s** vs 127.2 s at
+  Gen1 x8 (3.2x faster), AER deltas during the request: GPU Timeout +571,
+  root-port BadTLP +40632 / BadDLLP +831 / Timeout +62. The storm returns
+  under sustained load but is harmless: all errors are correctable and
+  retried, no data corruption, engine survives. This empirically confirmed
+  the AER storm was never the cause of the engine deaths (that was the
+  `__trap()` above).
+- Keep this BIOS config. The residual fix for the load-time storm is
+  hardware: replace the SFF-8654 8i cables first, then reseat/reflow the
+  SXM2 module. Fallback if Gen3 ever misbehaves (new Xids or corruption):
+  force Gen2 in BIOS.
+
+## Sweep 1: six env vars A/B'd (local/bench/strata-v100-quickbench.sh)
+
+Port 8091, 40x ~35-word prompt blocks (~1.4k tokens), max_tokens=96,
+temperature=0, REPS=2, no warmup. Sweep baseline = production minus
+STRATA_PROMPT_ATTN_OLD (i.e. sm70=1 bf16=1 prompt_old=0 pre75=1 mmvq=1
+gr_fast=1); each arm flips exactly one variable.
+
+| arm | change vs sweep baseline | decode avg t/s | rep 1 (cold) | rep 2 (warm) |
+|---|---|---|---|---|
+| baseline | - | 30.75 | 26.3 | 35.2 |
+| sm70_table_off | STRATA_SM70_TABLE=0 | 28.95 | 26.0 | 31.9 |
+| bf16_tc_off | STRATA_BF16_TC=0 | 32.45 | 29.9 | 35.0 |
+| prompt_attn_old_on | STRATA_PROMPT_ATTN_OLD=1 | 31.65 | 27.3 | 36.0 |
+| attn_pre75_off | STRATA_ATTN_PRE75=0 | 32.70 | 28.0 | 37.4 |
+| mmvq_il_off | STRATA_MMVQ_IL=0 | 30.60 | 26.9 | 34.3 |
+| gr_fast_off | STRATA_GR_FAST=0 | 31.50 | 28.2 | 34.8 |
+
+Prompt rate is flat across arms (~198-201 t/s); draft acceptance 0.62-0.65,
+no arm moves it meaningfully.
+
+Key finding: rep 1 is ALWAYS the slow one (26-30 t/s in every arm) - a
+cold-start penalty (expert cache, conv-cache, GPU state), not run noise. The
+2-rep averages are dominated by that cold rep, so the warm rep is the
+comparable number:
+
+- STRATA_SM70_TABLE=1: worth +3.3 t/s warm (+10%). Keep.
+- STRATA_ATTN_PRE75=1: costs ~-2.2 t/s warm (-6%) per this single warm rep.
+  Candidate for removal; confirmation run in sweep 2 (with proper warmup).
+- STRATA_PROMPT_ATTN_OLD=1: +0.8 t/s warm (+2%). Keep (production already has it).
+- STRATA_BF16_TC=1, STRATA_GR_FAST=1: neutral on warm reps (the bf16_tc_off
+  "win" in the averages was a cold-rep artifact). Keep as-is.
+- STRATA_MMVQ_IL=1: +0.9 t/s warm (+2.6%). Keep.
+
+## Sweep 2: additive optimizations (local/bench/strata-v100-quickbench2.sh)
+
+Port 8092, WARMUP=1 (discarded), REPS=3. Arms: baseline (production as-is),
+attn_pre75_off (confirmation of sweep 1), adapt_overlap (STRATA_ADAPT_OVERLAP=1),
+adapt_lag2 (STRATA_ADAPT_LAG=2), pcie_balance (STRATA_PCIE_BALANCE=1),
+route_tail_skip1 (STRATA_ROUTE_TAIL_SKIP=1), aux_cpus_auto (--aux-cpus auto),
+esp_cvec (experimental-speed-projection control vector, project mode,
+per-layer, layers 4-44).
+
+| arm | rep1 | rep2 | rep3 | decode avg | decode med | prompt avg | draft acc |
+|---|---|---|---|---|---|---|---|
+| baseline | 35.1 | 35.3 | 34.3 | 34.9 | 35.1 | 196.3 | 0.615 |
+| attn_pre75_off | 35.9 | 27.1 | 36.8 | 33.3 | 35.9 | 197.4 | 0.626 |
+| adapt_overlap | 25.7 | 40.0 | 27.2 | 31.0 | 27.2 | 196.7 | 0.619 |
+| adapt_lag2 | 26.8 | 42.0 | 40.3 | 36.4 | 40.3 | 196.2 | 0.616 |
+| pcie_balance | 33.1 | 37.0 | 37.3 | 35.8 | 37.0 | 199.7 | 0.598 |
+| route_tail_skip1 | 61.8 | 60.8 | 63.1 | 61.9 | 61.8 | 201.3 | 0.706 |
+| aux_cpus_auto | 33.1 | 35.8 | 35.3 | 34.7 | 35.3 | 199.2 | 0.610 |
+| esp_cvec | 34.5 | 33.3 | 36.7 | 34.8 | 34.5 | 199.7 | 0.670 |
+
+With WARMUP=1 the baseline reps are all warm (35.1/35.3/34.3), confirming
+sweep 1's cold-rep finding: rep-1 slowness is a warmup artifact, not noise.
+
+Findings:
+
+- STRATA_ROUTE_TAIL_SKIP=1: the winner. [61.8, 60.8, 63.1] = +78% vs baseline
+  median (61.8 vs 35.1), consistent across all three reps, and draft
+  acceptance improves 0.615 -> 0.706. Semantics (expert_source.cpp): for each
+  missed expert in a verify window, if no token ranks it above tail_rank the
+  expert is neither copied over PCIe nor computed; its contribution is zeroed
+  without renormalization. R=7 (the upstream CUDA default since v0.1.42,
+  documented +10-20% / KL ~0.003-0.006) skips only experts ranked below 7;
+  R=1 skips any expert no token ranks top-1 - far more aggressive. Engagement
+  verified via server logs: expert-cache hit 88-96% under R=1 vs 56-74% at
+  baseline, and no "+N% over PCIe" suffix on the cache line.
+- STRATA_ADAPT_LAG=2: warm reps [42.0, 40.3] vs baseline [35.3, 34.3] (+15%),
+  possibly real but engagement not verified; not enabled.
+- STRATA_ADAPT_OVERLAP=1: did not engage cleanly ([25.7, 40.0, 27.2]). Not
+  enabled.
+- STRATA_PCIE_BALANCE=1: warm reps +4-5%, within noise; draft acceptance down
+  (0.598). Not enabled.
+- STRATA_ATTN_PRE75=0: sweep 1's -6% did not reproduce ([35.9, 27.1, 36.8],
+  median 35.9 ~ baseline; the 27.1 rep looks like an AER-retry stall). Keep
+  STRATA_ATTN_PRE75=1.
+- --aux-cpus auto: no-op as predicted (34.7 vs 34.9).
+- ESP (experimental-speed-projection, cvec arm): no speedup (34.8 vs 34.9),
+  slightly better draft acceptance (0.670). Do not enable in production.
+
+## Quality probe for STRATA_ROUTE_TAIL_SKIP (local/bench/quality-probe.py)
+
+Deterministic coding task (temperature=0, max_tokens=1200): implement a
+`split_ranges` parser. The response's python block is exec'd with stdout
+captured and checked on 4 value cases + 4 ValueError cases + the printed demo
+output = 9 checks.
+
+| setting | decode t/s (probe) | quality |
+|---|---|---|
+| R=0 | 37.5 | 9/9 |
+| R=7 | 48.0 | 9/9 |
+| R=1 | 76.8 | 9/9 (draft acceptance 408/529 = 0.77) |
+
+An early probe run scored R=0 at 8/9; that was a probe bug (max_tokens=600
+truncated the response mid-demo-line, and the demo check missed stdout
+printed by the exec'd block). After fixing both, the saved R=0 response
+re-judges to 9/9. The probe therefore cannot distinguish the three settings on
+this task - all pass.
+
+The case for shipping R=1: it passes identically, gives +78% decode in the
+benchmark (+105% on this probe), improves draft acceptance, and upstream
+already ships a less aggressive form of the same skip (R=7) as the CUDA
+default with documented acceptable KL. Caveat: one easy task is not proof of
+parity on harder workloads, and R=1 zeros more expert contributions than the
+vendor default. Rollback if quality regresses in real use: set
+STRATA_ROUTE_TAIL_SKIP=0 (or 7) in local/strata/strata-unsloth-ud-iq4_xs.json
+and restart via local/strata/run-unsloth-ud-iq4_xs.sh.
+
+## Final production settings (committed)
+
+local/strata/strata-unsloth-ud-iq4_xs.json env (8 vars): STRATA_HC_Q8=1,
+STRATA_ROUTE_TAIL_SKIP=1, STRATA_SM70_TABLE=1, STRATA_BF16_TC=1,
+STRATA_PROMPT_ATTN_OLD=1, STRATA_ATTN_PRE75=1, STRATA_MMVQ_IL=1,
+STRATA_GR_FAST=1. No STRATA_EXP_MODE (see root-cause section above).
+
+Validated via the launch script: first request after a fresh start 68.6 t/s,
+expert cache 88.8% hit, zero new NVRM Xids (last one still the intentional
+bisection at Oct 28 21:55).

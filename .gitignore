@@ -5,4 +5,4 @@
 local/models/*.done
 local/models/download-*.log
 local/strata/*.log
-local/strata/*.json.bak
+local/strata/*.bak
