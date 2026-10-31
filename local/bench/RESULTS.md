@@ -556,3 +556,176 @@ STRATA_GR_FAST=1. No STRATA_EXP_MODE (see root-cause section above).
 Validated via the launch script: first request after a fresh start 68.6 t/s,
 expert cache 88.8% hit, zero new NVRM Xids (last one still the intentional
 bisection at Oct 28 21:55).
+
+## Model comparison: UD-Q4_K_XL vs production UD-IQ4_XS (2026-10-29)
+
+local/bench/model-bench.sh, quickbench2 methodology (WARMUP=1 discarded,
+REPS=3, same 40-block prompt = 2026 tokens, max_tokens=96, temperature=0,
+port 8092). Q4_K_XL pack: tools/iq_pack.py --gguf <shard 1> --out
+Strata-data/packs/unsloth-ud-q4_k_xl --compat-bf16 (1079 tensors, 303 native,
+arena 1.38 GiB, v4 native_experts.txt: layer 11 gate/up/down split across
+shards). Same 8 production env vars as IQ4_XS, incl. STRATA_ROUTE_TAIL_SKIP=1.
+
+| metric | UD-IQ4_XS (production) | UD-Q4_K_XL | delta |
+|---|---|---|---|
+| decode avg t/s | 61.9 | 52.2 | -16% |
+| decode reps | [61.8, 60.8, 63.1] | [50.6, 53.4, 52.7] | |
+| prompt avg t/s | 201.3 | 151.0 | -25% |
+| draft acceptance | 0.706 | 0.704 | ~equal |
+| experts in RAM | ~63 GiB | 71.73 GiB | +9.7 GiB |
+| quality top-1 / KL | 88.91% / 0.101 | 93.09% / 0.056 | better |
+
+Expert cache hit 88.4-94.6% under R=1 (same engagement as the IQ4_XS
+baseline, no "+N% over PCIe" suffix), so the gap is not a config artifact:
+Q4_K_XL expert blobs are larger per miss, and every miss costs more on the
+PCIe Gen3 x8 link. Prefill activates many experts per batch, which is why
+prompt ingest loses proportionally more (-25% vs -16%).
+
+Conclusion for this box: IQ4_XS stays the speed pick; Q4_K_XL buys ~4.2 top-1
+points and half the KL at a 16-25% speed cost. NVFP4 (next section) is the
+third data point.
+
+## Model comparison: NVFP4 (GPTQ) vs production UD-IQ4_XS (2026-10-29)
+
+Pipeline: strata/tools/nvfp4_convert.py --model local/models/nvfp4-conv
+--outfile local/models/Qwen3.8-Flash-Next-NVFP4.gguf (in-process llama.cpp
+converter, 444 s) -> 73.9 GB GGUF, 1511 tensors: 144 NVFP4 expert weights
+(blk.N.ffn_{gate,up,down}_exps.weight [2560,640,512]) + 144 F32 .scale
+tensors (per-expert weight_scale_2 tails), 302 Q8_0, 484 BF16, 580 F32.
+PLE is not in the GGUF by design: the engine reads it from --ple-gguf, which
+points at the kept IQ4_XS shard 2 (IQ4_NL, whitelisted). The converter's
+index_tensors() opens every part listed in model.safetensors.index.json, so
+the skipped 53.7 GB model-fp8-mtp-ple.safetensors had to be removed from a
+sanitized copy of the index (local/models/nvfp4-conv/: symlinks + index with
+3201 PLE entries dropped); MTP head tensors are dropped by the base converter
+and the engine uses Strata-data/mtp/rt.
+
+Pack: tools/iq_pack.py --gguf <NVFP4.gguf> --out Strata-data/packs/nvfp4 ->
+index.txt 1367 tensors, 302 native, arena 1.43 GiB; experts.bin 63.28 GiB
+(48 layers x 512 experts, uniform 2764816 B = 2.76 MB blobs, v3
+native_experts.txt, type 40 NVFP4). Config strata-nvfp4.json = production env
+minus STRATA_ROUTE_TAIL_SKIP (R=7 costs ~3.5 quality points on NVFP4).
+
+| metric | UD-IQ4_XS (production) | UD-Q4_K_XL | NVFP4 (GPTQ) |
+|---|---|---|---|
+| decode avg t/s | 61.9 | 52.2 (-16%) | 30.6 (-51%) |
+| decode reps | [61.8, 60.8, 63.1] | [50.6, 53.4, 52.7] | [28.9, 33.2, 29.8] |
+| prompt avg t/s | 201.3 | 151.0 (-25%) | 175.1 (-13%) |
+| draft acceptance | 0.706 | 0.704 | 0.561 |
+| experts in RAM | ~63 GiB | 71.73 GiB | 63.28 GiB |
+| GPU expert cache | 8 GiB budget | 2744 experts / 8 GiB | 3107 experts / 8 GiB |
+| cache hit (R=1) | ~88-95% | 88.4-94.6% | 50.1-68.9% |
+| PCIe share of routed experts | ~0 | ~0 | +1.2-1.3% |
+| quality top-1 / KL | 88.91% / 0.101 | 93.09% / 0.056 | 92.09% / 0.070 |
+
+Diagnosis (server.log): experts loaded 63.28 GiB at 2.16 GiB/s; the GPU
+expert cache holds 3107 NVFP4 experts in the same 8.00 GiB VRAM budget that
+holds only 2744 Q4_K_XL experts, yet hit rate is just 50-69% (NVFP4 routing
+is more diverse vs the calibrated profile). PCIe is NOT the bottleneck: only
++1.2-1.3% of routed experts go over the link, so even a 100% cache hit would
+gain ~1%. The decode loss is compute-bound: the binary's NVFP4 mmq configs
+target ampere and pascal-dp4a; Volta (sm_70) sits between them, so expert
+matmuls run slow. Prompt ingest (175 t/s) beats Q4_K_XL (151) but still
+trails IQ4_XS (201). Draft acceptance drops to 0.561: NVFP4 quantization
+noise lowers draft/target agreement, so speculative decoding accepts fewer
+tokens per step.
+
+Conclusion: on this V100 box NVFP4 is the worst decode option by far (-51%
+vs production) despite the smallest RAM footprint; its only win is prompt
+ingest vs Q4_K_XL. IQ4_XS remains the production pick for speed; Q4_K_XL is
+the quality pick if a 16-25% speed cost is acceptable.
+
+Disk: after the bench, local/models/nvfp4/ and nvfp4-conv/ (79 GB of
+safetensors) were deleted; the 73.9 GB GGUF + 64 GiB experts.bin pack stay on
+disk for re-runs.
+
+# Strata v0.2.8 rebuild + V100 optimization audit, 2026-10-31
+
+## Rebuild (v0.1.45 -> v0.2.8)
+
+Fork updated to upstream v0.2.8 and rebuilt for sm_70. Build recipe that works
+on this box: CC=gcc-14 CXX=g++-14 plus -DCMAKE_CUDA_HOST_COMPILER=/usr/bin/g++-14
+(system gcc 15 breaks nvcc host detection). New binary + libstrata_kq.so swapped
+into strata/engine-cuda12/ (old ones kept as *-v0145-backup). Pack and expert
+profile formats are compatible, no regeneration needed. Load speed improved to
+2.92 GiB/s (was 2.55); warm gen 52.5 t/s at 85.6% cache hit in the smoke test.
+The three re-ported llama-server endpoints (/apply-template, /tokenize, /infill)
+verified live on the new engine.
+
+## Baseline on v0.2.8 (production env, no extra knobs)
+
+quickbench2 methodology: 1 warmup discarded, 3 reps x 40 blocks of ~35 words
+(~2026 prompt tokens), max_tokens=96, temperature=0.
+
+| metric | v0.2.8 baseline | old v0.1.45 numbers (NOT comparable) |
+|---|---|---|
+| decode avg t/s | 40.6 (reps 38.7/37.1/46.1) | 46.0/51.0/53.9 |
+| prompt avg t/s | 151.2 | 151.0 |
+| draft acceptance | 0.6047 | 0.704 |
+
+The decode baseline dropped vs the old binary's recorded reps; the old numbers
+came from a different engine build and are not a valid comparison. All deltas
+below are against the v0.2.8 baseline measured the same day.
+
+## Single-arm A/B (one experimental knob at a time)
+
+| arm | knob(s) | decode t/s | delta | prompt t/s |
+|---|---|---|---|---|
+| adaptlag | STRATA_ADAPT_LAG=2 | 60.5 (reps 65.6/58.6/57.4) | +49.0% | 152.2 (+0.7%) |
+| scores-thread | STRATA_SCORES_THREAD=1 | 54.9 (reps 51.8/49.4/63.5) | +35.1% | 152.3 (+0.7%) |
+| adaptasync | --adapt-async 1 | 46.8 | +15.1% | 152.2 (+0.7%) |
+| dequantwide | STRATA_DEQUANT_WIDE=1 | 43.1 | +6.2% | 151.2 (flat) |
+| adaptoverlap | STRATA_ADAPT_OVERLAP=1 | 42.4 | +4.4% | 150.9 (-0.2%) |
+| bitexact | ATTN_DAILY+B6_MMVQ_ROWS+QSA_ROWS | 41.2 | +1.3% | 152.4 (+0.8%) |
+| pfwmma | STRATA_PF_WMMA=1 | 41.2 | +1.5% | 151.1 (flat) |
+| v100small | ARGMAX_ROWS_SM70+GR_NORM_FAST+Q8_GATHER_WIDE=0 | 40.9 | +0.6% | 151.1 (flat) |
+| gdnrecwarp2 | STRATA_GDN_REC_WARP=2 | 40.3 | -0.9% | 152.2 (+0.7%) |
+
+Long prompt (~30K tokens, PROMPT_REPEATS=600): baseline decode 48.5 / prompt
+96.6; STRATA_KV_PREFETCH=1 gives decode 51.2 (+5.6%) / prompt 97.9 (+1.3%).
+
+The top three knobs are all expert-cache scheduling options: they change when
+and how experts are prefetched from the 71.7 GiB RAM pool over PCIe Gen3 x8.
+On this box (x8 link, ~2.5-2.9 GiB/s effective) that pipeline is exactly where
+decode stalls, which explains why the gains far exceed the P100 numbers in the
+upstream docs (+3.5% for adapt-lag there).
+
+## Combos: the wins do not stack
+
+| combo | knobs | decode t/s | vs best single arm |
+|---|---|---|---|
+| combo-a | LAG=2 + SCORES_THREAD=1 + --adapt-async 1 | 45.8 (reps 42.6/48.3/46.5) | -24% vs adaptlag alone |
+| combo-b | combo-a + ADAPT_OVERLAP=1 + DEQUANT_WIDE=1 | 49.8 | -18% vs adaptlag alone |
+
+Running two or more cache-scheduling strategies at once makes them fight over
+the same prefetch pipeline and adds jitter; the result is worse than any single
+arm. Pick exactly one scheduling strategy, and on this box it is ADAPT_LAG=2.
+
+## Confirmation re-runs
+
+- adaptlag re-run (short prompt): decode 55.4 avg / 60.6 median -- reproduces
+  the win (+36% avg vs baseline avg 40.6, +57% median vs baseline median
+  38.7). Its worst rep still beats the baseline's best rep (57.4 vs 46.1), so
+  this is not an outlier.
+- adaptlag + KV_PREFETCH (long ~30K): decode 49.9 / prompt 95.5, i.e. +2.9%
+  over the long baseline and within noise of KV_PREFETCH alone (51.2). The two
+  do not conflict at long context.
+
+## Persisted production settings
+
+local/strata/strata-unsloth-ud-q4_k_xl.json env now carries, on top of the
+existing eight documented Volta vars:
+
+- STRATA_ADAPT_LAG=2 -- +36..49% decode (the big win)
+- STRATA_KV_PREFETCH=1 -- +2.9..5.6% at long context, neutral at short
+
+Expected production decode: ~55-60 t/s short context (was 40.6), ~50 t/s at
+~30K context (was 48.5). All other knobs tested were left OFF: they are either
+negligible, negative, or conflict with ADAPT_LAG.
+
+## Health notes
+
+AER during the 32-minute chain: +10264 correctable Timeout errors, zero
+uncorrectable -- the known harmless PCIe storm under sustained load. V100
+selected by UUID throughout; no engine crashes, all 12 arms + 5 follow-up runs
+completed cleanly.
