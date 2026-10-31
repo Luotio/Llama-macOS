@@ -57,5 +57,7 @@
   "top_p": 0.95,
   "top_k": 20,
   "min_p": 0.0
- }
+ },
+ "reasoning_close_retry": true,
+ "reasoning_loop_recovery": "recover"
 }
