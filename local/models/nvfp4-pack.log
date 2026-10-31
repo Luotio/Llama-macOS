@@ -1,0 +1,9 @@
+tokenizer/: vocab 248320, merges 247587, pre qwen35, specials {'tokenizer.ggml.eos_token_id': 248046, 'tokenizer.ggml.padding_token_id': 248044, 'tokenizer.ggml.bos_token_id': 248044}
+index.txt: 1367 tensors, 302 served natively, 0 in extra.bin, arena 1.43 GiB
+  layer  0  NVFP4   /NVFP4   blob  2764816  at 0.00 GiB
+  layer  8  NVFP4   /NVFP4   blob  2764816  at 10.55 GiB
+  layer 16  NVFP4   /NVFP4   blob  2764816  at 21.09 GiB
+  layer 24  NVFP4   /NVFP4   blob  2764816  at 31.64 GiB
+  layer 32  NVFP4   /NVFP4   blob  2764816  at 42.19 GiB
+  layer 40  NVFP4   /NVFP4   blob  2764816  at 52.73 GiB
+experts.bin: 48 layers, 63.28 GiB
