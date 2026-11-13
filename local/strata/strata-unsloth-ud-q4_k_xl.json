@@ -2,7 +2,7 @@
  "exe": "/mnt/git/local-llama-cpp/strata/engine-cuda12/strata",
  "args": [
   "--vram-reserve-mib",
-  "768",
+  "700",
   "--pack",
   "/mnt/git/local-llama-cpp/Strata-data/packs/unsloth-ud-q4_k_xl",
   "--native",
@@ -26,7 +26,9 @@
   "--kv-resident",
   "32768",
   "--conversation-cache-mib",
-  "8192"
+  "8192",
+  "--conversation-cache-slots",
+  "2"
  ],
  "cwd": "/mnt/git/local-llama-cpp/strata",
  "tokenizer": "/mnt/git/local-llama-cpp/Strata-data/packs/unsloth-ud-q4_k_xl/tokenizer",
@@ -53,11 +55,18 @@
  "gpu": 1,
  "gpus_asked": true,
  "sampling": {
-  "temperature": 1.0,
-  "top_p": 0.95,
-  "top_k": 20,
-  "min_p": 0.0
+   "temperature": 0.2,
+   "top_p": 0.95,
+   "top_k": 20,
+   "min_p": 0.0,
+   "repeat_penalty": 1.05,
+   "repeat_last_n": 256,
+   "repeat_stop_tokens": 48
  },
- "reasoning_close_retry": true,
- "reasoning_loop_recovery": "recover"
+ "reasoning_close_retry": false,
+ "reasoning_budget_tokens": 12000,
+ "reasoning_loop_recovery": "stop",
+ "reasoning_effort": "medium",
+ "tool_call_recovery": false,
+ "max_tokens": 16000
 }

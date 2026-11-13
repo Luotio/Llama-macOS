@@ -10,6 +10,8 @@
 #                                  # downloaded: the PLE table and MTP layer are reused from
 #                                  # the existing IQ4_XS shard / mtp-Qwen3.8-Flash-Next-Q8_0.gguf)
 #   ./download-model.sh iq4_xs     # re-download of the current production model, ~94 GB
+#   ./download-model.sh coder_iq1_m  # ISTA-DASLab GSQ-RCO Coder (256 of 512 experts), IQ1_M,
+#                                  # 2 shards, ~58.4 GB (+ ~0.9 GB mmproj for vision)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -74,8 +76,19 @@ case "${1:-}" in
     NEED_GIB=100   # 93.7 GB, plus headroom
     LOG="download-iq4xs.log"
     ;;
+  coder_iq1_m)
+    BASE="$HF/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF/resolve/main/IQ1_M"
+    FILES=(
+      "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00001-of-00002.gguf"
+      "Qwen3.8-Flash-Next-GSQ-RCO-IQ1_M-00002-of-00002.gguf"
+    )
+    # vision projector lives in the repo root, fetch it separately:
+    #   curl -fL -C - -O "$HF/ISTA-DASLab/Qwen3.8-Flash-Next-GSQ-RCO-Coder-GGUF/resolve/main/mmproj-Qwen3.8-Flash-Next-BF16.gguf"
+    NEED_GIB=59    # 29.6 + 28.8 GB
+    LOG="download-coder-iq1_m.log"
+    ;;
   *)
-    echo "usage: $0 {q4_k_xl|nvfp4|iq4_xs}" >&2
+    echo "usage: $0 {q4_k_xl|nvfp4|iq4_xs|coder_iq1_m}" >&2
     exit 2
     ;;
 esac

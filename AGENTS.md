@@ -25,11 +25,12 @@ Repo root: `/mnt/git/local-llama-cpp`. Goal: fast local inference for coding wor
 
 | UUID | Card | nvidia-smi index | NUMA node | Status |
 |---|---|---|---|---|
-| `GPU-40faaa73-acef-a2eb-1f38-7b96df067d5c` | V100 16 GB (sm_70) | 1 | **node 1** | **HEALTHY — the one to use** |
-| `GPU-f07f3af3-5f02-f364-0d37-2ab3a4c4afce` | V100 16 GB | 2 | node 1 | **FAULTY (RMA) — NEVER use** |
+| `GPU-40faaa73-acef-a2eb-1f38-7b96df067d5c` | V100 16 GB (sm_70) | 2 | **node 1** (0000:82:00.0) | healthy; the Strata engine ran on it for months; shows the harmless AER Timeout storm |
+| `GPU-e487578c-0be1-8c0b-ad8b-0ab0615c4850` | V100 16 GB (sm_70) | 1 | **node 1** (0000:81:00.0) | **RMA replacement (2026-11-13)**: llama-bench clean, zero AER, ECC 0; NVLink (NV6) to the other V100 |
+| `GPU-f07f3af3-5f02-f364-0d37-2ab3a4c4afce` | V100 16 GB | - | - | faulty card, returned for RMA (replaced by e487578c) |
 | `GPU-6f4fedec-c775-e942-f39d-bd77cf3f3384` | GTX 1080 8 GB (sm_61) | 0 | node 0 | works, small |
 
-(Indices re-verified 2026-10-18 after the two V100s were swapped between slots; UUIDs follow the physical modules.)
+(Indices re-verified 2026-11-13 after the RMA card arrived; UUIDs follow the physical modules. Configs select the card by nvidia-smi index, so the `"gpu"` index in each `local/strata/*.json` must be checked against the UUID whenever the cards move.)
 
 Driver 580.126.18. **PCIe link limit**: the healthy V100 is wired at Gen3 x8 (~5.6 GB/s measured host→device). This caps expert streaming — Strata rates on this box will be below what the upstream docs assume for full-width links; that is hardware, not a bug.
 
@@ -53,6 +54,7 @@ The healthy V100 is on **node 1**. Anything CPU-side that feeds the GPU (host th
 
 - **Qwen3.8-Flash-Next** (`qwen4exp`): 125B MoE / ~6B active + 51B PLE table, UD-IQ4_XS quant, 93.7 GB, 3 shards in `local/models/`. MTP draft at `Strata-data/mtp/rt`.
 - Qwen3.8-27B UD-Q4_K_XL: tier-3 benchmark baselines (see `local/bench/RESULTS.md`).
+- **Qwen3.8-Flash-Next Coder IQ1_M** (ISTA-DASLab GSQ-RCO, 2 shards, 58.4 GB): fastest option measured (~67-76 t/s decode, ~525 t/s prompt). Config `local/strata/strata-coder-iq1_m.json`, launcher `local/strata/run-coder-iq1_m.sh`, pack `Strata-data/packs/coder-iq1_m`. Pack build needs `STRATA_GGUF_PY=llama-cpp/gguf-py`. Settings and results: `local/bench/RESULTS.md` (Coder section). Vision is on (CPU reader: `strata/engine-cuda12/strata-vision` built from `strata/tools/vision`, mmproj in `local/models/`, config `"vision"` section + `--vision`); no VRAM or decode cost.
 
 ## Running Strata (primary server)
 
@@ -68,6 +70,10 @@ curl -s http://127.0.0.1:8080/health   # poll until "loaded":true (~55 s)
 - Key env in config: `STRATA_SM70_TABLE=1` (opt-in Volta decode kernels, bitwise-identical output, ~+10-15% decode), `STRATA_HC_Q8=1`, `STRATA_ROUTE_TAIL_SKIP=0`.
 - Key args: `--prefill auto:32768`, `--max-context 131072` (KV streaming, int8, kv-resident 32768; 131k costs only ~0.8 GiB extra RAM), `--conversation-cache-mib 8192` (prefix reuse across agent turns), `--spec 4 --spec-min-p 0.5 --mtp .../Strata-data/mtp/rt`, `--expert-cache auto`.
 - Engine build: `strata/engine-cuda12/`, Release/-O3, CUDA arch 70, `STRATA_EXPERIMENTAL_SM60=ON`. Already optimally configured; don't rebuild casually.
+
+### OpenRC service (boot-time / managed start)
+
+`local/openrc/` holds the service: `strata.initd` -> `/etc/init.d/strata`, `strata.confd` -> `/etc/conf.d/strata` (model choice via `STRATA_MODEL`, plus port, user, NUMA node, GPU-UUID guard). Install or update with `local/openrc/install.sh [--enable] [--restart]` (re-run after editing the init script; an existing conf.d is kept; `DESTDIR=/tmp/stage` for a dry run). Use `rc-service strata start|stop|restart|status|health|models`. The service refuses to start if port 8080 is taken (stop manually started servers first) or if the config's GPU index no longer matches `STRATA_GPU_UUID`. Output goes to `/var/log/strata/strata.log`; the engine's own log stays in `local/strata/`.
 
 ### VS Code Copilot integration (delft-solutions.llama-copilot)
 

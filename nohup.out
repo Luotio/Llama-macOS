@@ -1,0 +1,20 @@
+[strata] WARNING: This session has a real-time CPU limit (RLIMIT_RTTIME hard limit 0; the desktop's audio system sets it to 0 when rtkit is not installed). Linux can then end a program with signal 9 for no visible reason. Install rtkit, or start Strata outside the desktop session's limits, for example: systemd-run --user --collect -p LimitRTTIME=infinity -- strata serve ...
+[strata] sampling defaults from the config: temperature=1.0, top_p=0.95, top_k=20, min_p=0.0
+loading the model (the first start takes a minute or two) ...
+[strata] running on GPU 1 (as nvidia-smi numbers it); the engine's log calls it GPU 0 / CUDA0
+[strata] starting the engine: reading the model's weights ...
+Traceback (most recent call last):
+  File "/mnt/git/local-llama-cpp/strata/serve/server.py", line 9343, in <module>
+    sys.exit(main())
+             ~~~~^^
+  File "/mnt/git/local-llama-cpp/strata/serve/server.py", line 9032, in main
+    engine = StrataEngine(exe, engine_args(cfg) + (effort_end or []), cwd=cfg.get("cwd"), log=cfg.get("log"),
+                          env=env, lazy=lazy)
+  File "/mnt/git/local-llama-cpp/strata/serve/server.py", line 1083, in __init__
+    line = ready_q.get(timeout=left)
+  File "/usr/lib/python3.13/queue.py", line 210, in get
+    self.not_empty.wait(remaining)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
+  File "/usr/lib/python3.13/threading.py", line 363, in wait
+    gotit = waiter.acquire(True, timeout)
+KeyboardInterrupt

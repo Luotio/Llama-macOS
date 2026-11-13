@@ -1,0 +1,177 @@
+#!/sbin/openrc-run
+# OpenRC service for the Strata inference server on this machine.
+#
+# Installed to /etc/init.d/strata by local/openrc/install.sh (a copy, so the
+# service still starts if the repo is briefly unavailable). The server itself
+# is launched straight from the repository checkout. Which model is served,
+# the port, the user and the NUMA node are chosen in /etc/conf.d/strata.
+#
+#   rc-service strata start | stop | restart | status
+#   rc-service strata health      # ask the running server for /health
+#   rc-service strata models      # list the models that can be selected
+#   rc-update add strata default  # start at boot
+
+name="Strata inference server"
+description="Strata (llama.cpp-compatible OpenAI API) on the local V100"
+
+extra_commands="models"
+extra_started_commands="health"
+
+: "${STRATA_REPO:=/mnt/git/local-llama-cpp}"
+: "${STRATA_MODEL:=coder-iq1_m}"
+: "${STRATA_PORT:=8080}"
+: "${STRATA_USER:=juha}"
+: "${STRATA_NUMA_NODE:=1}"
+: "${STRATA_GPU_UUID:=}"
+: "${STRATA_EXTRA_ARGS:=}"
+: "${STRATA_START_TIMEOUT:=300}"
+: "${STRATA_STOP_TIMEOUT:=120}"
+
+strata_config="${STRATA_REPO}/local/strata/strata-${STRATA_MODEL}.json"
+strata_python="${STRATA_REPO}/strata/.venv/bin/python"
+strata_engine="${STRATA_REPO}/strata/engine-cuda12/strata"
+pidfile="/run/strata.pid"
+logdir="/var/log/strata"
+
+depend() {
+	need localmount
+	use net
+	after modules nvidia-persistenced
+}
+
+# Names of the selectable models: one local/strata/run-<name>.sh per model.
+strata_models() {
+	for f in "${STRATA_REPO}"/local/strata/run-*.sh; do
+		[ -e "$f" ] || continue
+		f="${f##*/run-}"
+		echo "${f%.sh}"
+	done
+}
+
+models() {
+	einfo "Selected: ${STRATA_MODEL} (set STRATA_MODEL in /etc/conf.d/strata)"
+	einfo "Available:"
+	strata_models | while read -r m; do
+		echo "    $m"
+	done
+}
+
+health() {
+	curl -fsS --max-time 5 "http://127.0.0.1:${STRATA_PORT}/health"
+	echo
+}
+
+strata_pid_alive() {
+	[ -r "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null
+}
+
+# The GPU is selected by index in the config; indices have moved before (the
+# two V100s were swapped between slots), so refuse to start on the wrong card.
+strata_check_gpu() {
+	[ -n "$STRATA_GPU_UUID" ] || return 0
+	local idx uuid
+	idx=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("gpu", ""))' "$strata_config") || return 1
+	uuid=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2>/dev/null |
+		awk -F', *' -v i="$idx" '$1 == i { print $2 }')
+	if [ "$uuid" != "$STRATA_GPU_UUID" ]; then
+		eerror "GPU index ${idx} in ${strata_config##*/} is '${uuid:-missing}', expected ${STRATA_GPU_UUID}"
+		eerror "Fix the gpu index in the config or STRATA_GPU_UUID in /etc/conf.d/strata"
+		return 1
+	fi
+}
+
+start_pre() {
+	if [ ! -f "$strata_config" ]; then
+		eerror "No config for STRATA_MODEL='${STRATA_MODEL}': ${strata_config}"
+		eerror "Available models: $(strata_models | tr '\n' ' ')"
+		return 1
+	fi
+	if [ ! -x "$strata_python" ] || [ ! -x "$strata_engine" ]; then
+		eerror "Strata is not built: need ${strata_python} and ${strata_engine}"
+		return 1
+	fi
+	if ss -Hltn "sport = :${STRATA_PORT}" 2>/dev/null | grep -q .; then
+		eerror "Port ${STRATA_PORT} is already in use (a manually started server?)"
+		return 1
+	fi
+	strata_check_gpu || return 1
+	checkpath -d -m 0755 -o "${STRATA_USER}" "$logdir"
+}
+
+start() {
+	ebegin "Starting ${name} (${STRATA_MODEL}, port ${STRATA_PORT}, NUMA node ${STRATA_NUMA_NODE})"
+	# numactl execs the interpreter, so the pid in the pidfile is the python
+	# server; no --exec is given because the venv python's /proc exe differs
+	# from the path started.
+	start-stop-daemon --start --background --make-pidfile \
+		--pidfile "$pidfile" \
+		--user "$STRATA_USER" \
+		--chdir "${STRATA_REPO}/strata" \
+		--stdout "${logdir}/strata.log" --stderr "${logdir}/strata.log" \
+		-- numactl "--cpunodebind=${STRATA_NUMA_NODE}" \
+		"$strata_python" "${STRATA_REPO}/strata/serve/server.py" \
+		--engine strata --config "$strata_config" \
+		--port "$STRATA_PORT" $STRATA_EXTRA_ARGS
+	eend $?
+}
+
+# Loading takes ~25-60 s; report once the model answers so that
+# "rc-service strata start" returns when the API is usable.
+start_post() {
+	local i=0
+	ebegin "Waiting for the model to load (up to ${STRATA_START_TIMEOUT} s)"
+	while [ "$i" -lt "$STRATA_START_TIMEOUT" ]; do
+		if ! strata_pid_alive; then
+			eend 1 "server exited during start-up, see ${logdir}/strata.log"
+			return 0
+		fi
+		if curl -fsS --max-time 2 "http://127.0.0.1:${STRATA_PORT}/health" 2>/dev/null |
+			grep -q '"loaded": *true'; then
+			eend 0
+			return 0
+		fi
+		sleep 2
+		i=$((i + 2))
+	done
+	eend 1 "not loaded after ${STRATA_START_TIMEOUT} s, still starting; check ${logdir}/strata.log"
+	return 0
+}
+
+# The Python wrapper can outlive an engine crash and the engine can outlive
+# the wrapper, so stop the wrapper first and then make sure the engine is gone
+# (it holds ~15 GiB of VRAM and tens of GiB of RAM).
+stop() {
+	ebegin "Stopping ${name}"
+	start-stop-daemon --stop --pidfile "$pidfile" \
+		--retry "TERM/${STRATA_STOP_TIMEOUT}/KILL/10"
+	local rc=$?
+	rm -f "$pidfile"
+	eend $rc
+}
+
+stop_post() {
+	local i=0
+	if pgrep -u "$STRATA_USER" -f "$strata_engine" >/dev/null 2>&1; then
+		ebegin "Stopping the leftover engine process"
+		pkill -TERM -u "$STRATA_USER" -f "$strata_engine"
+		while pgrep -u "$STRATA_USER" -f "$strata_engine" >/dev/null 2>&1; do
+			i=$((i + 1))
+			if [ "$i" -ge 30 ]; then
+				pkill -KILL -u "$STRATA_USER" -f "$strata_engine"
+				break
+			fi
+			sleep 1
+		done
+		eend 0
+	fi
+	return 0
+}
+
+status() {
+	if strata_pid_alive; then
+		einfo "status: started (pid $(cat "$pidfile"), model ${STRATA_MODEL})"
+		return 0
+	fi
+	einfo "status: stopped"
+	return 3
+}

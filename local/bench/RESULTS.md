@@ -1,5 +1,123 @@
 # Qwen3.8-27B and Qwen3.8-Flash-Next performance results
 
+## Qwen3.8-27B: llama-server 128K configuration (2026-11-13)
+
+Launcher: `local/serve-qwen38-27b-dual.sh`. Baseline settings: 131072
+context, 8 threads, q8_0 target KV, q4_0 draft KV, MTP draft max 2, batch
+1024/ubatch 512, single slot, 1:1 layer split. `--load-mode none` is the
+current no-mmap equivalent. Loopback replaces public binding by default.
+On startup the server reports `cache_reuse is not supported by this context`,
+so `--cache-reuse 256` does not enable non-prefix reuse.
+The three rotating coding speed prompts, temperature 0 and 256 token cap,
+gave 44.26, 41.06, 47.19 tok/s (mean 44.17), with 430/665 MTP draft tokens
+accepted. All hit the output cap; no task quality conclusion follows. After
+the run the replacement/original GPUs had about 4902/2058 MiB free, and zero
+uncorrectable volatile ECC errors. Four explicitly directed, single-step
+tool-call smoke tests (read, search, run, edit) returned the expected tool,
+exact arguments and finish reason 4/4. This is not an end-to-end agent test.
+MTP draft max 3 on the same three prompts averaged 43.06 tok/s (43.19,
+38.80, 47.18), 472/871 accepted, slightly slower than max 2; retain max 2.
+MTP2 with 60:40 layer split averaged 44.44 tok/s (44.70, 41.38, 47.23),
+with identical acceptance 430/665. After short prompts it left 2704/4256 MiB
+free versus 4902/2058 MiB with 1:1, so the launcher now defaults to 60:40.
+Using 16 threads with 60:40 gave 44.30 tok/s (44.52, 41.23, 47.15); retain
+8 threads, since the decode difference is negligible on this small sample.
+With MTP off and 60:40, decode averaged 30.67 tok/s (30.57, 30.74, 30.71);
+MTP2's 44.44 is about 45% faster on these capped prompts.
+The small speed difference may be noise; this split's long-context headroom
+and quality have not been independently tested. The 24.7K source prompt below
+used 1:1; the later 6.6K cache-switch probe used 60:40.
+
+A single simulated multi-turn clamp repair with 60:40 read the source and
+tests, produced the exact correct fix, and eventually ran the requested mock
+test and reported success. Before that it proposed a command beginning
+`cd /Users/$(whoami) 2>/dev/null;` which this restricted Linux sandbox rejected;
+it then retried the exact requested command. The probe therefore failed its
+strict no-unrecognized-command criterion. No model command or generated code
+was executed; the test response is simulated and accepts only one exact fix.
+This one artificial task is not a representative agent benchmark.
+
+A source-file prompt processed 24696 tokens at 807.4 prompt tok/s, then
+generated 256 capped tokens at 33.48 tok/s in 38.83 s wall time. Repeating
+the identical request processed only 4 prompt tokens and took 8.00 s (33.52
+decode tok/s): prefix reuse works, despite non-prefix cache reuse being
+unsupported. A later switch between short simulated conversations logged a
+2452.880 MiB prompt state skipped because `--cache-ram` was limited to
+1024 MiB; same-slot prefix reuse and cross-session RAM cache are distinct.
+This is not a full-context or realistic completed coding task. During these
+two source-file requests, the original GPU root port accumulated 18165 and
+its endpoint 32329 correctable PCIe errors; GPU ECC stayed zero and the
+original GPU reached 74 C. The pre-existing link problem makes sustained
+performance and reliability uncertain; full 128K stability remains untested.
+In a synthetic A-B-A conversation-switch probe (6559 prompt tokens each),
+1024 MiB evicted A: the last A reused 42 tokens and took 8.49 s. At 4096 MiB
+it reused 6555 tokens and took 1.50 s, with identical output-token settings.
+The saved launcher now defaults to 4096 MiB and accepts `CACHE_RAM_MIB` to
+override it. This trades more host memory for improved switching; longer
+snapshots can still exceed the limit, and 128K was not tested.
+
+Strata's documented families are Flash-Next, Qwen3.6-35B-A3B and DeepSeek;
+the 27B dense model is not listed as supported. No Strata 27B throughput or
+compatibility claim is made; the tested 27B server is llama.cpp.
+
+## Coder IQ1_M: initial two-V100 comparison (2026-11-13)
+
+Same Coder config and fixed coding prompts via local/bench/mtp-bench.py,
+3 repetitions x 256 output tokens, MTP spec 4 / min-p 0.6, medium reasoning,
+700 MiB primary reserve. GPU UUIDs: e487578c primary, 40faaa73 second.
+Single GPU: 80.5, 89.4, 94.9 tok/s; mean 88.27, acceptance 459/570.
+Two-GPU auto layer split, second reserve 1400 MiB: 92.7, 103.4, 98.8 tok/s;
+mean 98.30, acceptance 468/585. All responses hit the 256-token cap, so
+these are speed probes, not task-completion or tool-call quality measurements.
+Peer tier with 2400 MiB peer reserve: 79.3, 78.6, 89.9 tok/s; mean 82.60,
+acceptance 465/599. Startup reported 11491/12288 total GPU expert slots and
+1287 MiB free on the peer after prompt buffers. The peer and split execute
+different computation paths, so the numbers are not a quality comparison.
+The split used approximately 75-78% of all experts in VRAM, and after graph
+capture kept roughly 697 MiB and 1019 MiB free on the two GPUs.
+One 24790-token real-source prompt on the split: 1555.9 prompt tok/s,
+79.8 decode tok/s, 19.01 s total, 256 output tokens (capped). Single-GPU
+comparison at this context length and quality comparison remain unmeasured.
+The split still used STRATA_ROUTE_TAIL_SKIP=1, which changes results and has
+not been validated for agent quality. During the long prompt the original
+GPU root port 80:02.2 logged 39854 correctable AER errors and GPU 82:00.0
+logged 2139; the replacement's endpoint/root port stayed at zero. ECC was zero
+on both cards. Correctable errors are recovered, but the link needs repair;
+these results do not prove reliability or absence of unlogged Xids.
+The same four explicit tool smoke tests passed 3/4 with route-tail skip 1
+and recovery off: Coder searched for the old text instead of directly calling
+the requested edit tool. That call was valid and could be a reasonable safety
+step; the smoke test scores exact direct compliance, not end-to-end success.
+The dense 27B passed 4/4. Both used temperature 0 and a 1024-token limit;
+this tiny test cannot establish which is more reliable for real agent tasks.
+With route-tail skip 0 and tool-call recovery on, the same dual-GPU Coder
+speed probe averaged 87.63 tok/s (79.6, 92.6, 90.7; 459/576 accepted),
+versus 98.30 with skip 1/recovery off. The tool smoke test again scored
+3/4 with the same search instead of edit. Both options changed together;
+this does not isolate parser recovery, and neither smoke result establishes
+agentic quality. The existing fast profile is retained rather than silently
+changing the user's quality/speed tradeoff.
+The fast Coder also completed the same simulated clamp repair, with the exact
+fix and eventual passing mock test, in 7.85 s. It first proposed a `cd
+/workspace` prefix on the test command; the sandbox rejected that unsupported
+command, and it retried successfully, so strict no-error scoring failed for
+both models. Dense's comparable run was 10.95 s, but had a warm prompt prefix;
+one task and distinct model/server prompt handling do not establish agent
+quality or generalized end-to-end speed. No commands were executed.
+
+## Qwen3.8-27B: two V100s after RMA (2026-11-13)
+
+Existing UD-Q4_K_XL GGUF, llama-bench b611fc7fa7, both V100s selected by UUID
+(replacement e487578c first, original 40faaa73 second), NUMA node 1, 16 CPU
+threads, all layers offloaded, layer split 1/1, flash attention on, q8_0 KV.
+Three repetitions at short context, no speculative decoding: pp512
+913.73 +/- 21.52 tok/s; tg128 35.44 +/- 0.05 tok/s. This is not a 128K-context
+or agent-turn measurement, and is not directly comparable with the previous
+server MTP results. Both GPUs had zero volatile corrected and uncorrected ECC
+errors; replacement GPU AER total was zero, original GPU had 7200 correctable
+errors total since boot. At this earlier point, long-context speed, MTP and
+task quality remained untested; later experiments are reported above.
+
 Machine: 64 threads (AVX2 only, no AVX512), 109 GB RAM, 1x Tesla V100-SXM2-16GB
 usable + 1x GTX 1080 (8 GB) as temporary layer host. The second V100 is faulty
 (die-level register-file ECC faults, Xid 48/172/13/31, deterministic failure
@@ -729,3 +847,94 @@ AER during the 32-minute chain: +10264 correctable Timeout errors, zero
 uncorrectable -- the known harmless PCIe storm under sustained load. V100
 selected by UUID throughout; no engine crashes, all 12 arms + 5 follow-up runs
 completed cleanly.
+
+## Qwen3.8-Flash-Next Coder IQ1_M (ISTA-DASLab GSQ-RCO), 2026-11-01
+
+Model: 2 shards, 58.4 GB (shard 1 29.6 GB experts+dense, shard 2 28.8 GB n-gram
+table). 256 of 512 experts kept per layer, 10 active. Pack tag coder-iq1_m
+(tools/iq_pack.py, no --compat-bf16), profile expert-profile-coder.bin, shared MTP
+draft. Expert cache 4700 slots (8.94 GiB VRAM), 748 MiB VRAM free after load.
+Note: the sha256 for shard 1 in strata setup.py is stale; the file matches the
+Hugging Face LFS oid (bfa3644d...c211).
+
+Smoke test: coherent code output, 90.9 t/s decode on the first short request, no
+Xid or engine errors with the ten Q4_K_XL-tuned env vars.
+
+### Baseline (production env, spec 4 / min-p 0.5, quickbench2 methodology)
+
+| metric | Coder IQ1_M | Q4_K_XL (v0.2.8 + adaptlag, not same-day) |
+|---|---|---|
+| decode avg t/s (~2K prompt) | 67.1 | ~55-60 |
+| prompt avg t/s (~2K prompt) | 525 | 151 |
+| draft acceptance | 0.533 | 0.60 |
+
+### Sweep 1: scheduling and speculative depth (short prompt, decode t/s)
+
+| arm | decode | accept |
+|---|---|---|
+| spec 3 | 71.4 | 0.708 |
+| min-p 0.7 | 68.9 | 0.849 |
+| spec 5 | 68.8 | 0.583 |
+| base (spec 4, min-p 0.5) | 67.1 | 0.533 |
+| min-p 0.3 | 67.1 | 0.479 |
+| lookup-chain 3 | 67.0 | 0.530 |
+| no ADAPT_LAG | 63.2 | 0.598 |
+| SCORES_THREAD (instead of lag) | 63.2 | 0.598 |
+| spec 6 | 62.4 | 0.450 |
+| spec 8 | 59.6 | 0.405 |
+
+ADAPT_LAG=2 confirmed again (+6%); deeper speculation (6, 8) loses.
+
+### Sweep 2: combinations
+
+spec4/min-p 0.6 70.4, spec3/min-p 0.6 70.3, spec4/min-p 0.8 69.2, spec3/min-p 0.7
+69.2, spec5/min-p 0.7 66.3, spec2 62.6. Everything between spec 3-4 and min-p
+0.5-0.8 is within noise (69-71).
+
+### Real agent workload (tools/agent_turns_bench.py, 23 turns, 2.5K-50K tokens, 2 rounds)
+
+| arm | median decode t/s | vs spec4/0.5 |
+|---|---|---|
+| spec 4, min-p 0.6 | 75.7 | x1.018 (13/23 turns faster) |
+| spec 4, min-p 0.5 | 72.8 | baseline |
+| spec 3, min-p 0.5 | 71.7 | x1.017 (15/23) |
+
+Chosen: spec 4, min-p 0.6 (best on both benchmarks).
+
+### Sweep 3: VRAM trade-offs at ~30K prompt (2 reps, decode t/s)
+
+base 62.8, prefill auto:16384 64.9, kv-resident 65536 62.3, vram-reserve 500 62.1,
+kv-resident 16384 60.9. All within noise; defaults kept (kv-resident 32768,
+prefill auto:32768, reserve 700).
+
+### Conversation cache for long agentic sessions
+
+Single agent at a time, so 4 slots with a 16 GiB budget (was 2 slots / 8 GiB on
+Q4_K_XL, where RAM was the limit). A parked 59K-token conversation costs 1.5 GB,
+106K tokens 2.7 GB. Multi-turn test with a side request between agent turns: turn 2
+reused all 59301 cached tokens (restored in 192 ms), evictions=0, cold prefill
+of 59K tokens took 41.7 s (~1400 tok/s). RAM used 48 GiB with the server up.
+
+### Persisted production settings (local/strata/strata-coder-iq1_m.json)
+
+--spec 4 --spec-min-p 0.6, --kv int8, --kv-resident 32768, --prefill auto:32768,
+--max-context 131072, --vram-reserve-mib 700, --conversation-cache-mib 16384
+--conversation-cache-slots 4, env: the ten Q4_K_XL vars (HC_Q8, ROUTE_TAIL_SKIP,
+SM70_TABLE, BF16_TC, PROMPT_ATTN_OLD, ATTN_PRE75, MMVQ_IL, GR_FAST, ADAPT_LAG=2,
+KV_PREFETCH=1). Sampling/reasoning carried over from the Q4_K_XL config
+(temperature 0.2, repeat_penalty 1.05, reasoning effort medium, budget 12000).
+
+### Vision (Coder IQ1_M, CPU reader)
+
+Images enabled with the CPU reader: no VRAM cost (V100 still 15.5/16 GiB used, same as
+before) and no decode-time cost, because the encoder runs on the CPU at prompt time only.
+Pieces: strata-vision built from strata/tools/vision against strata/third_party/llama.cpp
+(cmake -G Ninja, STRATA_VISION_CUDA=OFF, gcc-14) and copied to strata/engine-cuda12/;
+mmproj-Qwen3.8-Flash-Next-BF16.gguf (907543008 bytes, sha256 b1a82259...9bd0) in local/models/;
+config "vision" section (exe, mmproj, model=shard 1, gpu false, max_tokens 300, threads 16)
+plus --vision in args. /health reports "images": true.
+Test (generated 640x400 PNG, red square + blue circle + text): correct description including
+the text; 6.0 s first request (encode + 159 tokens), 1.4 s repeat (image prefix cached,
+284 of 289 prompt tokens). One picture costs 289 prompt tokens.
+Optional later experiment: the GPU reader (needs ~1.2-1.4 GB VRAM and ~850 expert slots,
+about 5% decode cost) - not worth it for occasional screenshots.

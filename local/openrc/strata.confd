@@ -1,0 +1,36 @@
+# /etc/conf.d/strata - configuration for the Strata OpenRC service.
+# Installed by local/openrc/install.sh; an existing copy is never overwritten
+# unless the installer is run with --force-conf. Changes take effect on the
+# next "rc-service strata restart".
+
+# Checkout the server is launched from.
+STRATA_REPO="@REPO@"
+
+# Model to serve. Uses local/strata/strata-<STRATA_MODEL>.json; the choices are
+# the local/strata/run-<name>.sh launchers ("rc-service strata models"):
+#   coder-iq1_m            Qwen3.8-Flash-Next Coder IQ1_M (fastest, default)
+#   unsloth-ud-iq4_xs      Qwen3.8-Flash-Next UD-IQ4_XS
+#   unsloth-ud-q4_k_xl     Qwen3.8-27B UD-Q4_K_XL
+#   nvfp4                  NVFP4 (GPTQ)
+STRATA_MODEL="coder-iq1_m"
+
+# HTTP port of the OpenAI-compatible API (the VS Code extension expects 8080).
+STRATA_PORT="8080"
+
+# Unix user the server runs as (owns the model files and the repo).
+STRATA_USER="juha"
+
+# NUMA node the host thread and CPU pool run on. The healthy V100 is on node 1.
+STRATA_NUMA_NODE="1"
+
+# Refuse to start if the "gpu" index in the model config no longer points at
+# this card (the V100s have been swapped between slots before). Empty = no check.
+STRATA_GPU_UUID="GPU-40faaa73-acef-a2eb-1f38-7b96df067d5c"
+
+# Extra arguments for strata/serve/server.py (e.g. "--api-key ...").
+STRATA_EXTRA_ARGS=""
+
+# Seconds "start" waits for the model to answer /health, and "stop" waits for a
+# clean shutdown before it kills the process.
+STRATA_START_TIMEOUT="300"
+STRATA_STOP_TIMEOUT="120"
