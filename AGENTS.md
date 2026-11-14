@@ -89,6 +89,34 @@ local/bench/mtp-bench.py --url http://127.0.0.1:8095/v1 --label fn-mtp --reps 3
 
 Flash-Next recipe on this box: `--n-cpu-moe 999 -ot 'per_layer_token_embd=CPU' --moe-cache-mib 2048` (MoE experts on CPU, PLE table on GPU). Build archs: `61-real;70-real`.
 
+## Monitor (llama-mon, port 8085)
+
+`local/monitor/monitor.py` - Python 3 stdlib only, in-memory only (nothing
+written to disk). Dark-theme dashboard with 10-minute sparklines: one card per
+llama-server, one per GPU, plus a host card.
+
+- server: prompt tokens/s (busy), generation tokens/s (busy + wall clock),
+  spec-decode accept %, requests in flight, longest sequence
+- GPU (all cards by default, UUID filter via MON_GPUS): temperature,
+  utilization, VRAM used/total, power draw/limit, PCIe link Gen x width, and
+  PCIe AER correctable errors as rate/min + cumulative on one dual-axis
+  sparkline (GPU side and the upstream root port, so both link directions)
+- host: CPU %, load 1/5/15, RAM, swap, network rx + tx, uptime
+
+Data sources: llama-server `/metrics` + `/v1/models` (per MON_URLS), one
+nvidia-smi call per cycle for all cards, /proc for host stats. 2 s poll,
+1800 s window by default. JSON at `/api/stats`, liveness at `/healthz`.
+
+- Dashboard: `http://127.0.0.1:8085/`
+- OpenRC service: `sudo local/openrc/llama-mon-install.sh` installs, enables
+  at boot (default runlevel) and starts. Manage with `rc-service llama-mon
+  start|stop|restart|status|health`. Config: `/etc/conf.d/llama-mon`
+  (template `local/openrc/llama-mon.confd`: MON_HOST, MON_PORT, MON_URLS,
+  MON_INTERVAL, MON_WINDOW, MON_GPUS, MON_USER). Log:
+  /var/log/llama-mon/monitor.log
+- Ad hoc without the service:
+  `MON_PORT=8085 MON_URLS=http://127.0.0.1:8080 python3 local/monitor/monitor.py`
+
 ## Results and conventions
 
 - All benchmark numbers go in `local/bench/RESULTS.md` — append new sections there, keep the existing style (plain ASCII, no em dashes).

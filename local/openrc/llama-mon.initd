@@ -1,0 +1,111 @@
+#!/sbin/openrc-run
+# OpenRC service for the in-memory llama.cpp monitor.
+#
+# Installed to /etc/init.d/llama-mon by local/openrc/llama-mon-install.sh.
+# The monitor runs straight from the repository checkout:
+# local/monitor/monitor.py (Python 3 stdlib only, no venv needed). The port,
+# the polled servers, the poll interval and the GPU selection live in
+# /etc/conf.d/llama-mon.
+#
+#   rc-service llama-mon start | stop | restart | status
+#   rc-service llama-mon health      # ask the running monitor for /healthz
+#   rc-update add llama-mon default  # start at boot
+
+name="llama.cpp monitor"
+description="In-memory sparkline monitor for llama-server, GPUs and host"
+
+extra_started_commands="health"
+
+: "${MON_REPO:=/mnt/git/local-llama-cpp}"
+: "${MON_HOST:=127.0.0.1}"
+: "${MON_PORT:=8085}"
+: "${MON_URLS:=http://127.0.0.1:8080}"
+: "${MON_INTERVAL:=2}"
+: "${MON_WINDOW:=1800}"
+: "${MON_GPUS:=}"
+: "${MON_USER:=juha}"
+
+monitor_py="${MON_REPO}/local/monitor/monitor.py"
+monitor_python="/usr/bin/python3"
+pidfile="/run/llama-mon.pid"
+logdir="/var/log/llama-mon"
+
+depend() {
+	need localmount
+	use net
+	after modules nvidia-persistenced
+}
+
+health() {
+	curl -fsS --max-time 5 "http://${MON_HOST}:${MON_PORT}/healthz"
+	echo
+}
+
+mon_pid_alive() {
+	[ -r "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null
+}
+
+start_pre() {
+	if [ ! -f "$monitor_py" ]; then
+		eerror "Monitor not found: ${monitor_py}"
+		return 1
+	fi
+	if ss -Hltn "sport = :${MON_PORT}" 2>/dev/null | grep -q .; then
+		eerror "Port ${MON_PORT} is already in use (a manually started monitor?)"
+		return 1
+	fi
+	checkpath -d -m 0755 -o "${MON_USER}" "$logdir"
+}
+
+start() {
+	ebegin "Starting ${name} (port ${MON_PORT}, servers ${MON_URLS})"
+	# Export so start-stop-daemon hands the env to the child; the monitor
+	# reads all MON_* from the environment (see monitor.py).
+	export MON_HOST MON_PORT MON_URLS MON_INTERVAL MON_WINDOW MON_GPUS
+	start-stop-daemon --start --background --make-pidfile \
+		--pidfile "$pidfile" \
+		--user "$MON_USER" \
+		--chdir "${MON_REPO}" \
+		--stdout "${logdir}/monitor.log" --stderr "${logdir}/monitor.log" \
+		-- "$monitor_python" "$monitor_py"
+	eend $?
+}
+
+# The first sample is one poll cycle in; report once /healthz answers so
+# "rc-service llama-mon start" returns when the dashboard is usable.
+start_post() {
+	local i=0
+	ebegin "Waiting for the monitor to answer (up to 30 s)"
+	while [ "$i" -lt 30 ]; do
+		if ! mon_pid_alive; then
+			eend 1 "monitor exited during start-up, see ${logdir}/monitor.log"
+			return 0
+		fi
+		if curl -fsS --max-time 2 "http://${MON_HOST}:${MON_PORT}/healthz" 2>/dev/null \
+				| grep -q ok; then
+			eend 0
+			return 0
+		fi
+		sleep 1
+		i=$((i + 1))
+	done
+	eend 1 "no answer after 30 s; check ${logdir}/monitor.log"
+	return 0
+}
+
+stop() {
+	ebegin "Stopping ${name}"
+	start-stop-daemon --stop --pidfile "$pidfile" --retry "TERM/15/KILL/5"
+	local rc=$?
+	rm -f "$pidfile"
+	eend $rc
+}
+
+status() {
+	if mon_pid_alive; then
+		einfo "status: started (pid $(cat "$pidfile"), port ${MON_PORT})"
+		return 0
+	fi
+	einfo "status: stopped"
+	return 3
+}

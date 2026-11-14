@@ -1,0 +1,706 @@
+#!/usr/bin/env python3
+"""llama.cpp + GPU + host monitor with in-memory sparklines.
+
+Polls, every MON_INTERVAL seconds:
+  * llama-server /metrics endpoint(s)  (MON_URLS, one or more)
+  * nvidia-smi                         (one call per cycle, all GPUs)
+  * PCIe AER correctable-error counters from sysfs (GPU side AND the
+    upstream root port, so both directions of the link are covered)
+  * /proc: CPU, RAM, swap, load, network, uptime
+
+A fixed window of samples is kept in memory only; nothing is written to
+disk (except the service log when run under OpenRC). The app serves one
+dashboard page whose canvas sparklines are redrawn by the browser each
+poll cycle.
+
+Environment (defaults in parentheses, see local/openrc/llama-mon.confd):
+  MON_HOST     bind address                       (127.0.0.1)
+  MON_PORT     HTTP port                          (8085)
+  MON_URLS     llama-server base URL(s), comma or
+               space separated                    (http://127.0.0.1:8080)
+  MON_INTERVAL poll interval, seconds             (2)
+  MON_WINDOW   history to keep, seconds           (1800)
+  MON_GPUS     GPU UUIDs to show, comma/space sep (all)
+
+Python 3.9+, standard library only.
+"""
+
+import json
+import os
+import re
+import subprocess
+import threading
+import time
+import urllib.request
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
+
+POINTS = 300  # sparkline points handed to the browser (10 min at 2 s)
+
+# ---------------------------------------------------------------- inputs
+
+def http_get(url, timeout):
+    req = urllib.request.Request(url, headers={'User-Agent': 'llama-mon/1.0'})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read().decode('utf-8', 'replace')
+
+
+def parse_prom(text):
+    """Flat Prometheus text format -> {metric: float}. Labeled series ignored."""
+    out = {}
+    for line in text.splitlines():
+        if not line or line[0] == '#' or '{' in line:
+            continue
+        name, _, val = line.rpartition(' ')
+        try:
+            out[name] = float(val)
+        except ValueError:
+            pass
+    return out
+
+
+class Llama:
+    """One llama-server endpoint."""
+
+    def __init__(self, base):
+        self.base = base.rstrip('/')
+        self.label = urlsplit(self.base).netloc or self.base
+        self.prev = None
+        self.prev_wall = None
+        self.up = False
+        self.model = None
+        self.model_ts = 0.0
+
+    def sample(self, now):
+        try:
+            m = parse_prom(http_get(self.base + '/metrics', 3.0))
+        except Exception:
+            self.up = False
+            self.prev = None
+            return {'up': 0}
+        self.up = True
+        s = {'up': 1,
+             'req_proc': m.get('llamacpp:requests_processing'),
+             'req_def': m.get('llamacpp:requests_deferred'),
+             'seq_max': m.get('llamacpp:n_tokens_max')}
+        if self.prev is not None:
+            dt = now - self.prev_wall
+            if dt > 0.2:
+                p = self.prev
+
+                def delta(key):
+                    a, b = m.get(key), p.get(key)
+                    # a < b means the server restarted: no rate for this tick
+                    return a - b if (a is not None and b is not None and a >= b) else None
+
+                dpt = delta('llamacpp:prompt_tokens_total')
+                dps = delta('llamacpp:prompt_seconds_total')
+                dtp = delta('llamacpp:tokens_predicted_total')
+                dts = delta('llamacpp:tokens_predicted_seconds_total')
+                ddraft = delta('llamacpp:spec_decode_num_draft_tokens_total')
+                dacc = delta('llamacpp:spec_decode_num_accepted_tokens_total')
+                if dpt is not None:
+                    # tokens per busy second (model speed) and per wall second
+                    s['prompt_tps'] = dpt / dps if (dps or 0) > 0.01 else None
+                    s['prompt_wall'] = dpt / dt
+                if dtp is not None:
+                    s['gen_tps'] = dtp / dts if (dts or 0) > 0.01 else None
+                    s['gen_wall'] = dtp / dt
+                if ddraft and dacc is not None:
+                    s['spec_acc'] = 100.0 * dacc / ddraft
+        self.prev = {k: v for k, v in m.items() if k.endswith('_total')}
+        self.prev_wall = now
+        if now - self.model_ts > 30:
+            self.model_ts = now
+            try:
+                data = json.loads(http_get(self.base + '/v1/models', 3.0)).get('data') or []
+                if data and data[0].get('id'):
+                    self.model = data[0]['id']
+            except Exception:
+                pass
+        return s
+
+
+NV_FIELDS = ('index,uuid,name,pci.bus_id,temperature.gpu,utilization.gpu,'
+             'utilization.memory,memory.total,memory.used,power.draw,power.limit,'
+             'pcie.link.gen.current,pcie.link.width.current')
+
+
+def _num(x):
+    x = x.strip().strip('[]')
+    if x in ('', 'N/A', 'Not Supported'):
+        return None
+    try:
+        f = float(x)
+    except ValueError:
+        return None
+    return int(f) if f.is_integer() else f
+
+
+def _parent_bdf(bdf):
+    try:
+        p = os.path.dirname(os.path.realpath('/sys/bus/pci/devices/' + bdf))
+        return os.path.basename(p)
+    except OSError:
+        return None
+
+
+def read_aer(bdf):
+    """{label: count} from aer_dev_correctable, or None."""
+    try:
+        toks = open('/sys/bus/pci/devices/%s/aer_dev_correctable' % bdf).read().split()
+    except OSError:
+        return None
+    d = {}
+    for i in range(0, len(toks) - 1, 2):
+        try:
+            d[toks[i]] = int(toks[i + 1])
+        except ValueError:
+            pass
+    return d
+
+
+AER_DETAIL = ('BadTLP', 'BadDLLP', 'Timeout', 'Rollover')
+
+
+class GpuBank:
+    def __init__(self, uuid_filter):
+        self.filter = set(uuid_filter)
+        self.cards = []        # metadata + last live values (for the API)
+        self.aer_detail = {}   # bdf -> {'dev': {...}, 'port': {...}}
+        self.prev_aer = {}     # bdf -> (cumulative, wall)
+
+    def _query(self):
+        try:
+            out = subprocess.run(
+                ['nvidia-smi', '--query-gpu', NV_FIELDS, '--format=csv,noheader,nounits'],
+                capture_output=True, text=True, timeout=10)
+        except Exception:
+            return None
+        if out.returncode != 0:
+            return None
+        cards = []
+        for line in out.stdout.splitlines():
+            f = [x.strip() for x in line.split(',')]
+            if len(f) < 13:
+                continue
+            bdf = f[3]
+            if len(bdf) > 12:
+                bdf = bdf[4:]  # 00000000:81:00.0 -> 0000:81:00.0
+            if self.filter and f[1] not in self.filter:
+                continue
+            cards.append({
+                'uuid': f[1], 'name': f[2], 'bdf': bdf, 'index': _num(f[0]),
+                'temp': _num(f[4]), 'util': _num(f[5]), 'mem_util': _num(f[6]),
+                'mem_total': _num(f[7]), 'mem_used': _num(f[8]),
+                'power': _num(f[9]), 'power_limit': _num(f[10]),
+                'gen': _num(f[11]), 'width': _num(f[12]),
+            })
+        return cards
+
+    def sample(self, now):
+        cards = self._query()
+        if cards is None:
+            return {}
+        if not self.cards or [c['bdf'] for c in cards] != [c['bdf'] for c in self.cards]:
+            for c in cards:
+                c['port'] = _parent_bdf(c['bdf'])
+            self.cards = cards
+        s = {}
+        for i, c in enumerate(self.cards):
+            dev = read_aer(c['bdf'])
+            port = read_aer(c['port']) if c['port'] else None
+            self.aer_detail[c['bdf']] = {'dev': dev, 'port': port}
+            cum, have = 0, False
+            for d in (dev, port):
+                if d and d.get('TOTAL_ERR_COR') is not None:
+                    cum += d['TOTAL_ERR_COR']
+                    have = True
+            if have:
+                s['g%d.aer_cum' % i] = cum
+                prev = self.prev_aer.get(c['bdf'])
+                if prev and now > prev[1]:
+                    s['g%d.aer_rate' % i] = max(0.0, (cum - prev[0]) / (now - prev[1]) * 60.0)
+                else:
+                    s['g%d.aer_rate' % i] = 0.0
+                self.prev_aer[c['bdf']] = (cum, now)
+            s['g%d.temp' % i] = c['temp']
+            s['g%d.util' % i] = c['util']
+            s['g%d.mem_used' % i] = (c['mem_used'] / 1024.0) if c['mem_used'] is not None else None
+            s['g%d.mem_pct' % i] = (100.0 * c['mem_used'] / c['mem_total']
+                                    if c['mem_total'] and c['mem_used'] is not None else None)
+            s['g%d.power' % i] = c['power']
+        return s
+
+    def meta(self):
+        out = []
+        for i, c in enumerate(self.cards):
+            det = self.aer_detail.get(c['bdf'], {})
+            dev, port = det.get('dev'), det.get('port')
+
+            def brief(d):
+                return {k: d.get(k, 0) for k in AER_DETAIL} if d else None
+
+            out.append({'id': i, 'name': c['name'], 'uuid': c['uuid'],
+                        'index': c['index'], 'bdf': c['bdf'],
+                        'link': 'Gen%s x%s' % (c['gen'], c['width']),
+                        'power_limit': c['power_limit'],
+                        'mem_total': c['mem_total'],
+                        'aer_dev_total': dev.get('TOTAL_ERR_COR') if dev else None,
+                        'aer_port_total': port.get('TOTAL_ERR_COR') if port else None,
+                        'aer_dev': brief(dev), 'aer_port': brief(port)})
+        return out
+
+
+class HostBank:
+    def __init__(self):
+        self.prev_cpu = None
+        self.prev_net = None
+        self.prev_wall = None
+        self.cores = os.cpu_count() or 1
+        self.mem_total_kb = None
+        self.swap_total_kb = None
+
+    def sample(self, now):
+        s = {}
+        try:
+            f = [int(x) for x in open('/proc/stat').readline().split()[1:]]
+            idle = f[3] + (f[4] if len(f) > 4 else 0)
+            tot = sum(f)
+            if self.prev_cpu and tot > self.prev_cpu[1]:
+                s['h.cpu'] = 100.0 * (1.0 - (idle - self.prev_cpu[0]) / (tot - self.prev_cpu[1]))
+            self.prev_cpu = (idle, tot)
+        except Exception:
+            pass
+        try:
+            la = open('/proc/loadavg').read().split()
+            s['h.load1'] = float(la[0])
+            s['h.load5'] = float(la[1])
+            s['h.load15'] = float(la[2])
+        except Exception:
+            pass
+        try:
+            mi = {}
+            for line in open('/proc/meminfo'):
+                k, v = line.split(':', 1)
+                mi[k] = int(v.split()[0])
+            self.mem_total_kb = mi.get('MemTotal', self.mem_total_kb)
+            self.swap_total_kb = mi.get('SwapTotal', self.swap_total_kb)
+            avail = mi.get('MemAvailable')
+            if self.mem_total_kb:
+                s['h.ram'] = (self.mem_total_kb - (avail or 0)) / 1048576.0
+            if self.swap_total_kb:
+                s['h.swap'] = (self.swap_total_kb - mi.get('SwapFree', 0)) / 1048576.0
+        except Exception:
+            pass
+        try:
+            rx = tx = 0
+            for line in open('/proc/net/dev').read().splitlines()[2:]:
+                name, rest = line.split(':', 1)
+                name = name.strip()
+                if re.match(r'^(lo|veth|docker|br-|tap|virbr|kube|cni|flannel)', name):
+                    continue
+                f = rest.split()
+                rx += int(f[0])
+                tx += int(f[8])
+            if self.prev_net is not None and now > self.prev_wall:
+                dt = now - self.prev_wall
+                s['h.rx'] = (rx - self.prev_net[0]) / dt / 1e6
+                s['h.tx'] = (tx - self.prev_net[1]) / dt / 1e6
+            self.prev_net = (rx, tx)
+            self.prev_wall = now
+        except Exception:
+            pass
+        try:
+            s['h.uptime'] = float(open('/proc/uptime').read().split()[0])
+        except Exception:
+            pass
+        return s
+
+
+# ---------------------------------------------------------------- state
+
+class State:
+    def __init__(self, urls, interval, window, gpu_filter):
+        self.llamas = [Llama(u) for u in urls]
+        self.gpus = GpuBank(gpu_filter)
+        self.host = HostBank()
+        self.interval = interval
+        self.started = time.time()
+        self.hist = deque(maxlen=max(10, int(window / interval)))
+        self.lock = threading.Lock()
+
+    def collect(self):
+        now = time.time()
+        flat = {}
+        for i, ll in enumerate(self.llamas):
+            for k, v in ll.sample(now).items():
+                flat['s%d.%s' % (i, k)] = v
+        flat.update(self.gpus.sample(now))
+        flat.update(self.host.sample(now))
+        flat['t'] = now
+        with self.lock:
+            self.hist.append(flat)
+
+    def api(self):
+        with self.lock:
+            buf = list(self.hist)
+        n = min(POINTS, len(buf))
+        tail = buf[-n:] if n else []
+        keys, seen = [], set()
+        for smp in reversed(tail):
+            for k in smp:
+                if k != 't' and k not in seen:
+                    seen.add(k)
+                    keys.append(k)
+        series = {}
+        for k in keys:
+            series[k] = [round(v, 2) if isinstance(v, float) else v
+                         for v in (smp.get(k) for smp in tail)]
+        return {
+            'now': time.time(),
+            'interval': self.interval,
+            'points': n,
+            'monitor_uptime': round(time.time() - self.started, 1),
+            'servers': [{'id': i, 'label': ll.label, 'up': ll.up, 'model': ll.model}
+                        for i, ll in enumerate(self.llamas)],
+            'gpus': self.gpus.meta(),
+            'host': {'cores': self.host.cores,
+                     'mem_total': (self.host.mem_total_kb / 1048576.0)
+                     if self.host.mem_total_kb else None,
+                     'swap_total': (self.host.swap_total_kb / 1048576.0)
+                     if self.host.swap_total_kb else None},
+            'series': series,
+        }
+
+
+# ---------------------------------------------------------------- http
+
+PAGE = r'''<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>llama.cpp monitor</title>
+<style>
+:root{color-scheme:light;--bg:#f6f8fa;--card:#ffffff;--line:#d0d7de;--tx:#1f2328;
+--dim:#656d76;--acc:#0969da;--grn:#1a7f37;--amb:#9a6700;--red:#cf222e;--cyn:#0e7490;--vio:#8250df;}
+*{box-sizing:border-box}
+body{margin:0;padding:14px;background:var(--bg);color:var(--tx);
+font:13px/1.45 -apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif}
+h1{font-size:15px;margin:0 0 2px}
+.top{display:flex;justify-content:space-between;align-items:baseline;gap:12px;flex-wrap:wrap;
+margin-bottom:12px;padding:10px 14px;background:var(--card);border:1px solid var(--line);border-radius:10px}
+.top .meta{color:var(--dim);font-size:12px}
+.badge{display:inline-block;padding:1px 8px;border-radius:9px;font-size:11px;font-weight:600;margin-left:6px}
+.badge.up{background:#dafbe1;color:var(--grn);border:1px solid #aceebb}
+.badge.down{background:#ffebe9;color:var(--red);border:1px solid #ffcecb}
+.badge.link{background:#ddf4ff;color:var(--acc);border:1px solid #b6e3ff}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(370px,1fr))}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;min-width:0}
+.card h2{font-size:13px;margin:0 0 10px;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.card h2 .sub{color:var(--dim);font-weight:400;font-size:12px}
+.stats{display:flex;flex-wrap:wrap;gap:6px 18px;margin:0 0 10px}
+.stat{min-width:64px}
+.stat .k{color:var(--dim);font-size:10.5px;text-transform:uppercase;letter-spacing:.05em}
+.stat .v{font:600 14px/1.3 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.sl{margin:7px 0}
+.sl .row{display:flex;justify-content:space-between;font-size:11.5px;color:var(--dim);margin-bottom:1px}
+.sl .val{font:600 12px ui-monospace,Menlo,Consolas,monospace;color:var(--tx)}
+canvas{width:100%;height:46px;display:block}
+.dual .val{color:var(--amb)}
+</style></head><body>
+<div class="top"><h1>llama.cpp monitor <span id="h-badge"></span></h1>
+<div class="meta" id="h-meta"></div></div>
+<div class="grid" id="grid"></div>
+<script>
+"use strict";
+const $=id=>document.getElementById(id);
+let refs=null, lastData=null, timer=null;
+
+function fmt(v, u, d, dec){
+  if (v==null || Number.isNaN(v)) return "–";
+  d = (d===undefined) ? 1 : d; dec = (dec===undefined) ? true : dec;
+  const x = dec ? v.toFixed(d) : String(Math.round(v));
+  return u ? x+" "+u : x;
+}
+function fmtUptime(sec){
+  if (sec==null) return "–";
+  const d=Math.floor(sec/86400), h=Math.floor(sec%86400/3600), m=Math.floor(sec%3600/60);
+  return (d?d+"d ":"")+(h?h+"h ":"")+m+"m";
+}
+function esc(s){return s.replace(/[&<>"]/g, c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+
+function spark(cv, a, b, o){
+  o = o || {};
+  const w = cv.clientWidth || 300, h = cv.clientHeight || 46;
+  const dpr = window.devicePixelRatio || 1;
+  if (cv.width !== Math.round(w*dpr) || cv.height !== Math.round(h*dpr)){
+    cv.width = Math.round(w*dpr); cv.height = Math.round(h*dpr);
+  }
+  const x = cv.getContext("2d");
+  x.setTransform(dpr,0,0,dpr,0,0);
+  x.clearRect(0,0,w,h);
+  x.strokeStyle = "#d0d7de";
+  x.beginPath(); x.moveTo(0,h-.5); x.lineTo(w,h-.5); x.stroke();
+  const clean = a.filter(v => v!=null);
+  if (!clean.length) return;
+  let mn = Math.min(...clean), mx = Math.max(...clean);
+  if (o.min!=null) mn = Math.min(mn, o.min);
+  if (o.max!=null) mx = Math.max(mx, o.max);
+  if (mx-mn < 1e-9) mx = mn+1;
+  const pad = (mx-mn)*.12; mn -= pad; mx += pad;
+  const X = i => a.length>1 ? i/(a.length-1)*w : 0;
+  const Y = v => h-2-(v-mn)/(mx-mn)*(h-4);
+  const stroke = (arr, color, fill, scale) => {
+    x.beginPath(); let on = false, lastX = 0;
+    for (let i=0; i<arr.length; i++){
+      const v = arr[i];
+      if (v==null){ on = false; continue; }
+      const px = X(i), py = scale ? scale(v) : Y(v);
+      lastX = px;
+      if (!on){ x.moveTo(px,py); on = true; } else x.lineTo(px,py);
+    }
+    x.strokeStyle = color; x.lineWidth = fill ? 1.4 : 1;
+    if (!fill) x.setLineDash([3,3]);
+    x.stroke(); x.setLineDash([]);
+    if (fill){
+      const g = x.createLinearGradient(0,0,0,h);
+      g.addColorStop(0, color+"44"); g.addColorStop(1, color+"00");
+      x.lineTo(lastX, h); x.lineTo(0, h); x.closePath();
+      x.fillStyle = g; x.fill();
+    }
+  };
+  if (b){
+    stroke(a, o.color || "#0969da", true, null);
+    const cb = b.filter(v => v!=null);
+    if (cb.length){
+      let m2 = Math.min(...cb), M2 = Math.max(...cb);
+      if (M2-m2 < 1e-9) M2 = m2+1;
+      const p2 = (M2-m2)*.12; m2 -= p2; M2 += p2;
+      stroke(b, o.color2 || "#bf8700", false,
+             v => h-2-(v-m2)/(M2-m2)*(h-4));
+    }
+  } else {
+    stroke(a, o.color || "#0969da", true, null);
+  }
+}
+
+function makeSpark(parent, label, key, unit, color, opts){
+  opts = opts || {};
+  const div = document.createElement("div");
+  div.className = "sl" + (opts.extra ? " dual" : "");
+  const row = document.createElement("div"); row.className = "row";
+  const l = document.createElement("span"); l.textContent = label;
+  const val = document.createElement("span"); val.className = "val";
+  row.append(l, val);
+  const cv = document.createElement("canvas");
+  div.append(row, cv); parent.append(div);
+  const o = { val, cv, unit, d: opts.d, dec: opts.dec, extra: opts.extra,
+              color, key };
+  o.refresh = ser => {
+    const a = ser[o.key] || [];
+    o.val.textContent = fmt(a[a.length-1], o.unit, o.d, o.dec);
+    spark(cv, a, o.extra ? ser[o.extra] : null,
+          { color: o.color, color2: o.extra ? "#bf8700" : null });
+  };
+  return o;
+}
+
+function statVal(ser, key, unit, d, dec){
+  const a = ser && ser[key];
+  if (!a || !a.length) return "–";
+  const v = a[a.length-1];
+  if (v==null) return "–";
+  return (dec===false ? String(Math.round(v)) : v.toFixed(d)) + (unit ? " "+unit : "");
+}
+
+function setStat(parent, k, v){
+  let el = parent.querySelector('.stat[data-k="'+k+'"]');
+  if (!el){
+    el = document.createElement("div"); el.className = "stat"; el.dataset.k = k;
+    el.innerHTML = '<div class="k"></div><div class="v"></div>';
+    el.querySelector(".k").textContent = k;
+    parent.append(el);
+  }
+  el.querySelector(".v").textContent = (v==null || v==="") ? "–" : v;
+}
+
+function build(d){
+  const grid = $("grid"); grid.innerHTML = "";
+  const servers = [], gpus = [], host = {};
+  d.servers.forEach(s => {
+    const c = document.createElement("div"); c.className = "card";
+    const h2 = document.createElement("h2");
+    h2.innerHTML = 'llama-server <span class="sub"></span> <span class="sbad"></span>';
+    h2.querySelector(".sub").textContent = s.label;
+    c.append(h2);
+    const st = document.createElement("div"); st.className = "stats"; c.append(st);
+    const rec = { st, badge: h2.querySelector(".sbad"), sparks: [
+      makeSpark(c, "Prompt processing", "s"+s.id+".prompt_tps", "t/s", "#0969da"),
+      makeSpark(c, "Generation", "s"+s.id+".gen_tps", "t/s", "#1a7f37"),
+      makeSpark(c, "Generation (wall clock)", "s"+s.id+".gen_wall", "t/s", "#8250df")]};
+    servers[s.id] = rec; grid.append(c);
+  });
+  d.gpus.forEach(g => {
+    const i = g.id;
+    const c = document.createElement("div"); c.className = "card";
+    const h2 = document.createElement("h2");
+    h2.innerHTML = '<span class="gn"></span> <span class="sub"></span> <span class="badge link"></span>';
+    h2.querySelector(".gn").textContent = g.name;
+    h2.querySelector(".sub").textContent = "idx "+g.index+" · "+g.bdf;
+    h2.querySelector(".badge.link").textContent = g.link || "?";
+    c.append(h2);
+    const st = document.createElement("div"); st.className = "stats"; c.append(st);
+    const rec = { st, sparks: [
+      makeSpark(c, "Temperature", "g"+i+".temp", "°C", "#cf222e", { d: 0 }),
+      makeSpark(c, "GPU utilization", "g"+i+".util", "%", "#0969da", { d: 0 }),
+      makeSpark(c, "VRAM", "g"+i+".mem_pct", "%", "#8250df", { d: 0 }),
+      makeSpark(c, "Power", "g"+i+".power", "W", "#bf8700"),
+      makeSpark(c, "PCIe AER (rate /min + cumulative)", "g"+i+".aer_rate", "/min",
+                "#cf222e", { extra: "g"+i+".aer_cum" })]};
+    gpus[i] = rec; grid.append(c);
+  });
+  {
+    const c = document.createElement("div"); c.className = "card";
+    const h2 = document.createElement("h2");
+    h2.innerHTML = 'Host <span class="sub hs"></span>';
+    c.append(h2);
+    const st = document.createElement("div"); st.className = "stats"; c.append(st);
+    host.rec = { st, hs: h2.querySelector(".hs"), sparks: [
+      makeSpark(c, "CPU", "h.cpu", "%", "#0969da"),
+      makeSpark(c, "RAM used", "h.ram", "GB", "#1a7f37"),
+      makeSpark(c, "Network (rx + tx)", "h.rx", "MB/s", "#0e7490", { extra: "h.tx" })]};
+    grid.append(c);
+  }
+  refs = { servers, gpus, host: host.rec };
+}
+
+function update(d){
+  lastData = d;
+  if (!refs) build(d);
+  const ser = d.series;
+  const upN = d.servers.filter(s => s.up).length;
+  $("h-badge").innerHTML = upN === d.servers.length
+    ? '<span class="badge up">'+d.servers.length+' server'+(d.servers.length>1?"s":"")+' up</span>'
+    : '<span class="badge down">'+upN+"/"+d.servers.length+' up</span>';
+  $("h-meta").textContent = "poll "+d.interval+"s · "+d.points+" pts shown · host up "+
+    fmtUptime(ser["h.uptime"] ? ser["h.uptime"][ser["h.uptime"].length-1] : null)+
+    " · monitor up "+fmtUptime(d.monitor_uptime);
+  d.servers.forEach(s => {
+    const r = refs.servers[s.id]; if (!r) return;
+    r.badge.innerHTML = s.up
+      ? '<span class="badge up">UP</span>'+(s.model ? ' <span class="sub">'+esc(s.model)+"</span>" : "")
+      : '<span class="badge down">DOWN</span>';
+    setStat(r.st, "requests", statVal(ser, "s"+s.id+".req_proc", null, 0, false));
+    setStat(r.st, "deferred", statVal(ser, "s"+s.id+".req_def", null, 0, false));
+    setStat(r.st, "max seq", statVal(ser, "s"+s.id+".seq_max", "tok", 0, false));
+    setStat(r.st, "spec accept", statVal(ser, "s"+s.id+".spec_acc", "%"));
+  });
+  d.gpus.forEach(g => {
+    const r = refs.gpus[g.id]; if (!r) return;
+    const i = g.id;
+    setStat(r.st, "temp", statVal(ser, "g"+i+".temp", "°C", 0));
+    setStat(r.st, "util", statVal(ser, "g"+i+".util", "%", 0));
+    setStat(r.st, "vram", g.mem_total
+      ? statVal(ser, "g"+i+".mem_used", " / "+(g.mem_total/1024).toFixed(0)+" GB")
+      : "–");
+    setStat(r.st, "power", statVal(ser, "g"+i+".power", "W")+
+      (g.power_limit ? " / "+g.power_limit+" W" : ""));
+    setStat(r.st, "aer total", statVal(ser, "g"+i+".aer_cum", null, 0, false));
+    setStat(r.st, "aer/min", statVal(ser, "g"+i+".aer_rate", null, 1));
+  });
+  {
+    const r = refs.host;
+    r.hs.textContent = d.host.cores+" cores";
+    const l1 = ser["h.load1"] && ser["h.load1"][ser["h.load1"].length-1];
+    const l5 = ser["h.load5"] && ser["h.load5"][ser["h.load5"].length-1];
+    const l15 = ser["h.load15"] && ser["h.load15"][ser["h.load15"].length-1];
+    setStat(r.st, "load 1/5/15",
+      (l1!=null) ? l1.toFixed(1)+" / "+l5.toFixed(1)+" / "+l15.toFixed(1) : "–");
+    setStat(r.st, "ram", d.host.mem_total
+      ? statVal(ser, "h.ram", " / "+d.host.mem_total.toFixed(0)+" GB") : "–");
+    setStat(r.st, "swap", d.host.swap_total
+      ? statVal(ser, "h.swap", " / "+d.host.swap_total.toFixed(0)+" GB") : "–");
+    setStat(r.st, "uptime", fmtUptime(
+      ser["h.uptime"] ? ser["h.uptime"][ser["h.uptime"].length-1] : null));
+  }
+  const all = [...refs.servers, ...Object.values(refs.gpus)].filter(Boolean);
+  all.push(refs.host);
+  for (const r of all) for (const sp of r.sparks) sp.refresh(ser);
+}
+
+async function tick(){
+  try {
+    const r = await fetch("/api/stats", { cache: "no-store" });
+    const d = await r.json();
+    update(d);
+    if (timer) clearInterval(timer);
+    timer = setInterval(tick, Math.round(d.interval*1000));
+  } catch (e) {
+    if (timer) clearInterval(timer);
+    timer = setInterval(tick, 2000);
+  }
+}
+window.addEventListener("resize", () => { if (refs && lastData) update(lastData); });
+tick();
+</script></body></html>
+'''
+
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = 'llama-mon/1.0'
+    state = None  # set in main()
+
+    def _send(self, code, body, ctype):
+        data = body if isinstance(body, bytes) else body.encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', ctype)
+        self.send_header('Content-Length', str(len(data)))
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        path = self.path.split('?', 1)[0]
+        if path == '/':
+            self._send(200, PAGE, 'text/html; charset=utf-8')
+        elif path == '/api/stats':
+            self._send(200, json.dumps(self.state.api()), 'application/json')
+        elif path == '/healthz':
+            self._send(200, 'ok\n', 'text/plain')
+        else:
+            self._send(404, 'not found\n', 'text/plain')
+
+    def log_message(self, fmt, *args):
+        if self.path not in ('/', '/api/stats', '/healthz'):
+            super().log_message(fmt, *args)
+
+
+def main():
+    host = os.environ.get('MON_HOST', '127.0.0.1')
+    port = int(os.environ.get('MON_PORT', '8085'))
+    urls = [u for u in re.split(r'[,\s]+', os.environ.get('MON_URLS', 'http://127.0.0.1:8080')) if u]
+    interval = max(0.5, float(os.environ.get('MON_INTERVAL', '2')))
+    window = int(os.environ.get('MON_WINDOW', '1800'))
+    gpu_filter = [u for u in re.split(r'[,\s]+', os.environ.get('MON_GPUS', '')) if u]
+
+    state = State(urls, interval, window, gpu_filter)
+    Handler.state = state
+
+    def loop():
+        while True:
+            t0 = time.time()
+            try:
+                state.collect()
+            except Exception as e:
+                print('collect error: %r' % e, flush=True)
+            time.sleep(max(0.0, interval - (time.time() - t0)))
+
+    threading.Thread(target=loop, daemon=True).start()
+    print('llama-mon: http://%s:%d/  servers=%s interval=%.1fs window=%ds gpus=%s'
+          % (host, port, ','.join(urls), interval, window, gpu_filter or 'all'), flush=True)
+    ThreadingHTTPServer((host, port), Handler).serve_forever()
+
+
+if __name__ == '__main__':
+    main()

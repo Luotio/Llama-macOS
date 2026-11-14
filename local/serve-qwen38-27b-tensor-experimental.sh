@@ -21,6 +21,7 @@ export CUDA_VISIBLE_DEVICES="$gpu1,$gpu2"
 export GGML_CUDA_ALLREDUCE="${GGML_CUDA_ALLREDUCE:-nccl}"
 exec numactl --cpunodebind=1 "${SERVER_BIN:-$repo/llama-cpp/build-v100-nccl/bin/llama-server}" \
     --model "$repo/local/models/Qwen3.8-27B-UD-Q4_K_XL.gguf" \
+    --alias "Michael" \
     --host "${HOST:-127.0.0.1}" --port "${PORT:-8080}" \
     --ctx-size "${CTX_SIZE:-131072}" --n-gpu-layers 999 --split-mode tensor \
     --tensor-split 1,1 --fit off --flash-attn on \
