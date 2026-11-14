@@ -40,7 +40,7 @@ class TemplateRequestError(jinja2.exceptions.TemplateError, ValueError):
 class ChatTemplate:
     """The model's chat template, rendered with the same Jinja settings as transformers' apply_chat_template."""
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, system_prompt: str = ""):
         def raise_exception(message):
             raise TemplateRequestError(message)
 
@@ -51,6 +51,13 @@ class ChatTemplate:
         env.filters["tojson"] = tojson
         env.globals["raise_exception"] = raise_exception
         self.source = Path(path).read_text(encoding="utf-8")
+        if system_prompt:
+            # Include the prefix in the exposed template too, so clients that
+            # render /props locally get the same prompt as the server.
+            prefix = json.dumps(system_prompt, ensure_ascii=False)
+            self.source = ("{%- if messages %}{%- set messages = "
+                           "[{'role': 'system', 'content': " + prefix + "}] + messages %}"
+                           "{%- endif %}" + self.source)
         self.template = env.from_string(self.source)
         self.caps = self._detect_caps()
 

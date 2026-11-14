@@ -3,6 +3,8 @@
  "args": [
   "--vram-reserve-mib",
   "700",
+  "--vram-reserve-later-mib",
+  "1400",
   "--pack",
   "/mnt/git/local-llama-cpp/Strata-data/packs/unsloth-ud-q4_k_xl",
   "--native",
@@ -26,13 +28,16 @@
   "--kv-resident",
   "32768",
   "--conversation-cache-mib",
-  "8192",
+  "16384",
   "--conversation-cache-slots",
-  "2"
+  "4",
+  "--vision"
  ],
  "cwd": "/mnt/git/local-llama-cpp/strata",
  "tokenizer": "/mnt/git/local-llama-cpp/Strata-data/packs/unsloth-ud-q4_k_xl/tokenizer",
  "model_name": "qwen3.8-flash-next-unsloth-ud-q4_k_xl",
+ "aliases": ["Michael"],
+ "system_prompt": "You are Michael, a coding agent powered by Qwen3.8-Flash-Next UD-Q4_K_XL running on Strata. Help with software development and use available tools when appropriate.",
  "log": "/mnt/git/local-llama-cpp/local/strata/strata-unsloth-ud-q4_k_xl.log",
  "lib_dirs": [
   "/opt/cuda/bin",
@@ -52,7 +57,9 @@
   "STRATA_ADAPT_LAG": "2",
   "STRATA_KV_PREFETCH": "1"
  },
- "gpu": 1,
+ "gpu": [1, 2],
+ "gpu_order": "as_given",
+ "layer_split": "auto",
  "gpus_asked": true,
  "sampling": {
    "temperature": 0.2,
@@ -68,5 +75,13 @@
  "reasoning_loop_recovery": "stop",
  "reasoning_effort": "medium",
  "tool_call_recovery": false,
- "max_tokens": 16000
+ "max_tokens": 16000,
+ "vision": {
+  "exe": "/mnt/git/local-llama-cpp/strata/engine-cuda12/strata-vision",
+  "mmproj": "/mnt/git/local-llama-cpp/local/models/mmproj-Qwen3.8-Flash-Next-BF16.gguf",
+  "model": "/mnt/git/local-llama-cpp/local/models/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+  "gpu": false,
+  "max_tokens": 300,
+  "threads": 16
+ }
 }

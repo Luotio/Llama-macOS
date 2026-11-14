@@ -32,10 +32,14 @@ nvidia-smi indices moved. NEVER address the cards by index or PCI BDF in
 scripts; always use the UUID (works in both CUDA_VISIBLE_DEVICES and
 nvidia-smi -i):
 
-| UUID                                   | Status                | PCI after 2026-10-17 swap |
-|----------------------------------------|-----------------------|----------------------------|
-| GPU-40faaa73-acef-a2eb-1f38-7b96df067d5c | HEALTHY, in use      | 82:00.0                    |
-| GPU-f07f3af3-5f02-f364-0d37-2ab3a4c4afce | FAULTY, RMA pending  | 81:00.0                    |
+| UUID                                   | Status                | PCI slot |
+|----------------------------------------|-----------------------|----------|
+| GPU-40faaa73-acef-a2eb-1f38-7b96df067d5c | in use (AER storm on its link, see 2026-11-14 section below) | 82:00.0 |
+| GPU-e487578c-0be1-8c0b-ad8b-0ab0615c4850 | in use, RMA replacement (2026-11-13), link clean | 81:00.0 |
+
+The faulty card GPU-f07f3af3-5f02-f364-0d37-2ab3a4c4afce (described below)
+lived in the 81:00.0 slot; it was shipped for RMA on 2026-11-13 and replaced
+by GPU-e487578c.
 
 GTX 1080 (GPU-6f4fedec-c775-e942-f39d-bd77cf3f3384) at PCI 04:00.0 drives the
 desktop display; never use it for inference.
@@ -104,6 +108,77 @@ both V100 UUIDs to a file).
   as AER/Physical Layer errors or a failed/narrow link, not SM register-file
   ECC.)
 - Slot problem: the fault followed the card across both slots.
+
+## PCIe AER link isolation (2026-11-14, live counters)
+
+Question: only one of the two bifurcated links shows AER errors - is that
+real, or does Linux fail to separate the bifurcated x16 slot? Answer: it is
+real. The bifurcation produces TWO independent root ports (80:02.0 ->
+81:00.0, 80:02.2 -> 82:00.0), each with its own link training, its own AER
+capability and its own sysfs counters; the SXM2 adapter runs ONE SFF-8654
+8i cable per GPU socket. Nothing is shared between the two links, so a
+per-link counter cannot be polluted by the other side.
+
+Counters read 2026-11-14 (sysfs aer_dev_correctable, both ends of each link;
+per-boot counters, so absolute values are for that uptime):
+
+    link 81:00.0 (GPU e487578c, the RMA replacement):
+        root port 80:02.0 RX:  all zero            GPU TX:  all zero, Gen3 x8
+    link 82:00.0 (GPU 40faaa73):
+        root port 80:02.2 RX:  BadTLP 2507464  Timeout 300033  BadDLLP 9829
+                               TOTAL_ERR_COR 2809647
+        GPU TX:                Timeout 3008067, Gen3 x8
+
+Interpretation:
+
+- The GPU-side "TX Timeout" and the root-port-side "RX BadTLP/Timeout"
+  count the SAME physical event from both ends: GPU->host transfers that
+  arrive corrupted or never get ACKed. That is the Phase 2 (GPU-TX)
+  direction of the link eye, matching the 2026-10 diagnosis.
+- The 81:00.0 path (cable + connectors + riser socket + new GPU) is now
+  empirically proven clean: the faulty f07f3af3 card lived on that side,
+  and its replacement shows zero errors on both ends. The 82:00.0 side has
+  been the storming one since the October observations.
+- Suspect list on the 82:00.0 path, in order: (1) the 8i cable (prime
+  suspect), (2) the riser SXM2 socket / connector on that side, (3) the
+  GPU 40faaa73's own TX - least likely: a vanilla llama-bench on it ran
+  spotless, and the errors appear on both ends of the link (a channel
+  problem, not a sender problem).
+- Rates under load are far above the October idle baseline (~24/min): the
+  27B server is tensor-split across BOTH V100s, so the bad link is under
+  sustained transfer (observed ~100k/min on the 82:00.0 side). Still
+  correctable-only: link retries recover the errors, no Xids. The llama-mon
+  dashboard (local/monitor, port 8085) shows this live as the per-GPU
+  "PCIe AER (rate /min + cumulative)" sparkline.
+
+Planned discriminator test - swap the 8i cables (or, equivalently, swap the
+two GPUs between the riser sockets; both give the same electrical mapping).
+GPU 40faaa73 has never been tested on the clean cable, so this is the test
+that separates "bad cable" from "bad GPU TX". When doing it:
+
+- After the swap the BDFs follow the root ports, the UUIDs follow the cards:
+  40faaa73 will appear at 81:00.0, e487578c at 82:00.0.
+- Re-check any config that selects a card by nvidia-smi index (Strata
+  local/strata/*.json "gpu" field, llama-server tensor split) against the
+  UUIDs before starting inference, per the AGENTS.md rule.
+- Snapshot the counters before and after (and watch the monitor in between):
+
+      for bdf in 80:02.0 80:02.2 81:00.0 82:00.0; do
+        echo "== $bdf"; cat /sys/bus/pci/devices/0000:$bdf/aer_dev_correctable | tr '\n' ' '; echo;
+      done
+
+- Reading the result: if the storm FOLLOWS GPU 40faaa73 (now shows up on
+  root port 80:02.0 RX + the GPU's TX at 81:00.0), the module's TX is the
+  suspect and the card goes back for RMA. If the storm STAYS on root port
+  80:02.2 (now serving e487578c), the fault is in that side's cable /
+  connector / riser socket and the 8i cable is replaced first (cheapest
+  real fix, per the October analysis).
+
+Side finding (2026-11-14): the GTX 1080 (native slot 00:03.0, PCI 04:00.0)
+retrained Gen3 x16 -> Gen1 x16 -> Gen3 x16 within a couple of minutes, with
+zero AER on both ends of its link. A soft "could not converge at Gen3 that
+one time" event, not data corruption; a separate, minor issue from the
+82:00.0 storm.
 
 ## Benchmarks
 

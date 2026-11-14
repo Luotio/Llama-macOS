@@ -60,66 +60,186 @@ def parse_prom(text):
     return out
 
 
-class Llama:
-    """One llama-server endpoint."""
+class Backend:
+    """One inference endpoint. The backend kind (llama-server emitting
+    Prometheus text, vs Strata emitting JSON) is re-detected on EVERY poll
+    from the response body, so an endpoint that swaps backends across a
+    restart is handled without restarting the monitor."""
 
-    def __init__(self, base):
+    def __init__(self, base, interval=2.0):
         self.base = base.rstrip('/')
         self.label = urlsplit(self.base).netloc or self.base
-        self.prev = None
-        self.prev_wall = None
+        self.interval = max(0.5, float(interval))
         self.up = False
+        self.kind = None            # 'llama' | 'strata' | None (not yet probed)
         self.model = None
         self.model_ts = 0.0
+        # llama.cpp Prometheus baseline (cumulative *_total counters)
+        self.l_prev = None
+        self.l_prev_wall = None
+        # Strata baseline (cumulative totals + request ids already turned into
+        # backfill blocks, so each finished request contributes exactly once)
+        self.s_prev_totals = None
+        self.s_prev_wall = None
+        self.s_seen_ids = set()
+        self.seq_max = 0            # high-water observed sequence length
 
+    # ---- detection + dispatch -------------------------------------------
     def sample(self, now):
         try:
-            m = parse_prom(http_get(self.base + '/metrics', 3.0))
+            body = http_get(self.base + '/metrics', 3.0)
         except Exception:
             self.up = False
-            self.prev = None
+            self.l_prev = self.s_prev_totals = None
             return {'up': 0}
         self.up = True
-        s = {'up': 1,
-             'req_proc': m.get('llamacpp:requests_processing'),
-             'req_def': m.get('llamacpp:requests_deferred'),
-             'seq_max': m.get('llamacpp:n_tokens_max')}
-        if self.prev is not None:
-            dt = now - self.prev_wall
-            if dt > 0.2:
-                p = self.prev
-
-                def delta(key):
-                    a, b = m.get(key), p.get(key)
-                    # a < b means the server restarted: no rate for this tick
-                    return a - b if (a is not None and b is not None and a >= b) else None
-
-                dpt = delta('llamacpp:prompt_tokens_total')
-                dps = delta('llamacpp:prompt_seconds_total')
-                dtp = delta('llamacpp:tokens_predicted_total')
-                dts = delta('llamacpp:tokens_predicted_seconds_total')
-                ddraft = delta('llamacpp:spec_decode_num_draft_tokens_total')
-                dacc = delta('llamacpp:spec_decode_num_accepted_tokens_total')
-                if dpt is not None:
-                    # tokens per busy second (model speed) and per wall second
-                    s['prompt_tps'] = dpt / dps if (dps or 0) > 0.01 else None
-                    s['prompt_wall'] = dpt / dt
-                if dtp is not None:
-                    s['gen_tps'] = dtp / dts if (dts or 0) > 0.01 else None
-                    s['gen_wall'] = dtp / dt
-                if ddraft and dacc is not None:
-                    s['spec_acc'] = 100.0 * dacc / ddraft
-        self.prev = {k: v for k, v in m.items() if k.endswith('_total')}
-        self.prev_wall = now
-        if now - self.model_ts > 30:
-            self.model_ts = now
+        if body.lstrip()[:1] == '{':
             try:
-                data = json.loads(http_get(self.base + '/v1/models', 3.0)).get('data') or []
-                if data and data[0].get('id'):
-                    self.model = data[0]['id']
-            except Exception:
-                pass
+                data = json.loads(body)
+            except ValueError:
+                data = None
+            if isinstance(data, dict) and ('live' in data or 'totals' in data):
+                self.kind = 'strata'
+                s = self._sample_strata(now, data)
+            else:
+                return {'up': 1, 'kind': self.kind}   # JSON, not our shape
+        else:
+            self.kind = 'llama'
+            s = self._sample_llama(now, parse_prom(body))
+        s['kind'] = self.kind
+        self._refresh_model(now)
         return s
+
+    def _gap(self, prev_wall, now):
+        """A long gap (endpoint switched backend kind, monitor paused, host
+        suspend) means cumulative counters jumped: skip rates for one tick."""
+        return prev_wall is None or (now - prev_wall) > self.interval * 3 + 5
+
+    def _ticks(self, busy_s):
+        return max(1, int(round(busy_s / self.interval)))
+
+    # ---- llama.cpp: Prometheus text, counters arrive in LUMPS -----------
+    def _sample_llama(self, now, m):
+        s = {'req_proc': m.get('llamacpp:requests_processing'),
+             'req_def': m.get('llamacpp:requests_deferred'),
+             'seq_max': m.get('llamacpp:n_tokens_max'),
+             'prompt_wall': 0.0, 'gen_wall': 0.0}
+        if self.l_prev is not None and not self._gap(self.l_prev_wall, now):
+            p = self.l_prev
+
+            def delta(key):
+                a, b = m.get(key), p.get(key)
+                # a < b => server restarted: no rate for this tick
+                return a - b if (a is not None and b is not None and a >= b) else None
+
+            dpt = delta('llamacpp:prompt_tokens_total')
+            dps = delta('llamacpp:prompt_seconds_total')
+            dtp = delta('llamacpp:tokens_predicted_total')
+            dts = delta('llamacpp:tokens_predicted_seconds_total')
+            dd = delta('llamacpp:spec_decode_num_draft_tokens_total')
+            da = delta('llamacpp:spec_decode_num_accepted_tokens_total')
+            dc = delta('llamacpp:prompt_tokens_cached_total')
+            # llama flushes prompt tokens+seconds in ONE scrape at the first
+            # output token, and predicted tokens+seconds in ONE scrape at the
+            # end of the slot. So d/dt is one spike per request. Instead take
+            # the busy speed (tokens / busy-seconds) and spread it back over
+            # the trailing ticks that phase actually ran -> solid block.
+            if dpt and (dps or 0) > 0.05:
+                sp = dpt / dps
+                s['prompt_tps'] = sp
+                s['_pp'] = (sp, self._ticks(dps))
+            if dtp and (dts or 0) > 0.05:
+                sp = dtp / dts
+                s['gen_tps'] = sp
+                s['_gp'] = (sp, self._ticks(dts))
+            if dd and da is not None:
+                s['spec_acc'] = 100.0 * da / dd
+            if dc and (dc + (dpt or 0)) > 0:
+                s['cache_pct'] = 100.0 * dc / (dc + dpt)
+        self.l_prev = {k: v for k, v in m.items() if k.endswith('_total')}
+        self.l_prev_wall = now
+        return s
+
+    # ---- Strata: JSON metrics, EXACT per-request records + live rates ---
+    def _sample_strata(self, now, d):
+        live = d.get('live') or {}
+        state = live.get('state')
+        busy = bool(state) and state != 'idle'
+        s = {'req_proc': 1 if busy else 0,
+             'req_def': live.get('queued') or 0}
+        pf = live.get('prefill_tok_s_mean')
+        tk = live.get('tok_s')
+        # live streaming rates give immediate feedback while a request runs;
+        # consecutive busy polls naturally form a solid block on the sparkline.
+        s['prompt_wall'] = pf if (busy and pf) else 0.0
+        s['gen_wall'] = tk if (busy and tk) else 0.0
+        if pf:
+            s['prompt_tps'] = pf
+        if tk:
+            s['gen_tps'] = tk
+        cur = (live.get('prompt_total') or 0) + (live.get('generated') or 0)
+        if cur > self.seq_max:
+            self.seq_max = cur
+        s['seq_max'] = self.seq_max or None
+        # aggregate spec-accept between completions, from cumulative totals
+        t = d.get('totals') or {}
+        if self.s_prev_totals is not None and not self._gap(self.s_prev_wall, now):
+            do = (t.get('output_tokens', 0) or 0) - (self.s_prev_totals.get('output_tokens', 0) or 0)
+            da = (t.get('drafts_accepted', 0) or 0) - (self.s_prev_totals.get('drafts_accepted', 0) or 0)
+            dd = (t.get('drafts_offered', 0) or 0) - (self.s_prev_totals.get('drafts_offered', 0) or 0)
+            if dd and do:
+                s['spec_acc'] = 100.0 * da / dd
+        self.s_prev_totals = t
+        self.s_prev_wall = now
+        # the most recent NOT-yet-seen finished request -> exact block+stats
+        reqs = d.get('requests') or []
+        for r in reversed(reqs):
+            rid = r.get('id')
+            if rid in self.s_seen_ids:
+                continue
+            self.s_seen_ids.add(rid)
+            pt = r.get('prompt_total') or r.get('prompt_tokens') or 0
+            ot = r.get('output_tokens') or r.get('engine_generated') or 0
+            pms = r.get('prompt_ms') or 0.0
+            dms = r.get('decode_ms') or 0.0
+            reused = r.get('reused') or 0
+            if pt + ot > self.seq_max:
+                self.seq_max = pt + ot
+            uncached = max(pt - reused, 0)
+            if pms > 1 and uncached > 0:
+                sp = round(uncached / (pms / 1000.0), 1)
+                s['_pp'] = (sp, self._ticks(pms / 1000.0))
+                s['prompt_tps'] = sp
+                s['last_prompt_tok'] = uncached
+            if dms > 1 and ot > 0:
+                sp = round(ot / (dms / 1000.0), 1)
+                s['_gp'] = (sp, self._ticks(dms / 1000.0))
+                s['gen_tps'] = sp
+                s['last_decode_tok'] = ot
+            if pt > 0:
+                s['cache_pct'] = round(100.0 * reused / pt, 1)
+            if r.get('drafts_offered') and r.get('drafts_accepted') is not None:
+                s['spec_acc'] = round(100.0 * r['drafts_accepted'] / r['drafts_offered'], 1)
+            break
+        ids = {r.get('id') for r in reqs}
+        if len(self.s_seen_ids) > 512:
+            self.s_seen_ids &= ids
+        return s
+
+    def _refresh_model(self, now):
+        if now - self.model_ts <= 30:
+            return
+        self.model_ts = now
+        try:
+            if self.kind == 'strata':
+                mid = json.loads(http_get(self.base + '/health', 3.0)).get('model')
+            else:
+                data = json.loads(http_get(self.base + '/v1/models', 3.0)).get('data') or []
+                mid = data[0]['id'] if data else None
+            if mid:
+                self.model = mid
+        except Exception:
+            pass
 
 
 NV_FIELDS = ('index,uuid,name,pci.bus_id,temperature.gpu,utilization.gpu,'
@@ -207,6 +327,11 @@ class GpuBank:
             for c in cards:
                 c['port'] = _parent_bdf(c['bdf'])
             self.cards = cards
+        else:
+            # topology unchanged: refresh the live fields (temp/util/mem/power)
+            # in the cached cards; the fresh query result carries no 'port'.
+            for old, new in zip(self.cards, cards):
+                old.update(new)
         s = {}
         for i, c in enumerate(self.cards):
             dev = read_aer(c['bdf'])
@@ -323,7 +448,7 @@ class HostBank:
 
 class State:
     def __init__(self, urls, interval, window, gpu_filter):
-        self.llamas = [Llama(u) for u in urls]
+        self.backends = [Backend(u, interval) for u in urls]
         self.gpus = GpuBank(gpu_filter)
         self.host = HostBank()
         self.interval = interval
@@ -334,14 +459,26 @@ class State:
     def collect(self):
         now = time.time()
         flat = {}
-        for i, ll in enumerate(self.llamas):
-            for k, v in ll.sample(now).items():
-                flat['s%d.%s' % (i, k)] = v
+        patches = []   # (series-key, value, n_trailing_ticks)
+        for i, b in enumerate(self.backends):
+            for k, v in b.sample(now).items():
+                if k in ('_pp', '_gp'):
+                    key = 's%d.prompt_wall' % i if k == '_pp' else 's%d.gen_wall' % i
+                    val, n = v
+                    patches.append((key, round(val, 2), int(n)))
+                else:
+                    flat['s%d.%s' % (i, k)] = v
         flat.update(self.gpus.sample(now))
         flat.update(self.host.sample(now))
         flat['t'] = now
         with self.lock:
             self.hist.append(flat)
+            # spread a just-finished phase's average speed back over the ticks
+            # it actually ran (current tick + the N-1 older ones), so the
+            # sparkline shows a solid block instead of a single spike.
+            for key, val, n in patches:
+                for j in range(1, min(n, len(self.hist)) + 1):
+                    self.hist[-j][key] = val
 
     def api(self):
         with self.lock:
@@ -363,8 +500,9 @@ class State:
             'interval': self.interval,
             'points': n,
             'monitor_uptime': round(time.time() - self.started, 1),
-            'servers': [{'id': i, 'label': ll.label, 'up': ll.up, 'model': ll.model}
-                        for i, ll in enumerate(self.llamas)],
+            'servers': [{'id': i, 'label': b.label, 'up': b.up, 'model': b.model,
+                         'kind': b.kind}
+                        for i, b in enumerate(self.backends)],
             'gpus': self.gpus.meta(),
             'host': {'cores': self.host.cores,
                      'mem_total': (self.host.mem_total_kb / 1048576.0)
@@ -445,10 +583,13 @@ function spark(cv, a, b, o){
   const clean = a.filter(v => v!=null);
   if (!clean.length) return;
   let mn = Math.min(...clean), mx = Math.max(...clean);
+  const fixed = (o.min!=null) || (o.max!=null);
   if (o.min!=null) mn = Math.min(mn, o.min);
   if (o.max!=null) mx = Math.max(mx, o.max);
   if (mx-mn < 1e-9) mx = mn+1;
-  const pad = (mx-mn)*.12; mn -= pad; mx += pad;
+  if (!fixed){
+    const pad = (mx-mn)*.12; mn -= pad; mx += pad;
+  }
   const X = i => a.length>1 ? i/(a.length-1)*w : 0;
   const Y = v => h-2-(v-mn)/(mx-mn)*(h-4);
   const stroke = (arr, color, fill, scale) => {
@@ -483,6 +624,15 @@ function spark(cv, a, b, o){
   } else {
     stroke(a, o.color || "#0969da", true, null);
   }
+  {
+    const lab = v => v >= 1000 ? Math.round(v/100)/10+"k"
+                               : (Number.isInteger(v) ? String(v) : v.toFixed(1));
+    x.fillStyle = "#656d76";
+    x.font = "10px ui-monospace,Menlo,Consolas,monospace";
+    x.textAlign = "right";
+    x.fillText(lab(mx), w-2, 10);
+    if (fixed && mn !== mx) x.fillText(lab(mn), w-2, h-3);
+  }
 }
 
 function makeSpark(parent, label, key, unit, color, opts){
@@ -496,22 +646,32 @@ function makeSpark(parent, label, key, unit, color, opts){
   const cv = document.createElement("canvas");
   div.append(row, cv); parent.append(div);
   const o = { val, cv, unit, d: opts.d, dec: opts.dec, extra: opts.extra,
-              color, key };
+              min: opts.min, max: opts.max, color, key };
   o.refresh = ser => {
     const a = ser[o.key] || [];
     o.val.textContent = fmt(a[a.length-1], o.unit, o.d, o.dec);
     spark(cv, a, o.extra ? ser[o.extra] : null,
-          { color: o.color, color2: o.extra ? "#bf8700" : null });
+          { color: o.color, color2: o.extra ? "#bf8700" : null,
+            min: o.min, max: o.max });
   };
   return o;
 }
 
-function statVal(ser, key, unit, d, dec){
+function lastv(ser, key){
   const a = ser && ser[key];
-  if (!a || !a.length) return "–";
-  const v = a[a.length-1];
-  if (v==null) return "–";
-  return (dec===false ? String(Math.round(v)) : v.toFixed(d)) + (unit ? " "+unit : "");
+  if (!a) return null;
+  for (let i = a.length - 1; i >= 0; i--) if (a[i] != null) return a[i];
+  return null;
+}
+function fmtK(v){
+  if (v == null) return "";
+  v = Math.round(v);
+  return v >= 10000 ? (v/1000).toFixed(v>=100000?0:1)+"k" : String(v);
+}
+function statVal(ser, key, unit, d, dec){
+  const v = lastv(ser, key);
+  if (v == null) return "\u2013";
+  return (dec === false ? String(Math.round(v)) : v.toFixed(d)) + (unit ? " "+unit : "");
 }
 
 function setStat(parent, k, v){
@@ -531,14 +691,15 @@ function build(d){
   d.servers.forEach(s => {
     const c = document.createElement("div"); c.className = "card";
     const h2 = document.createElement("h2");
-    h2.innerHTML = 'llama-server <span class="sub"></span> <span class="sbad"></span>';
+    h2.innerHTML = '<span class="knd"></span> <span class="sub"></span> <span class="sbad"></span>';
     h2.querySelector(".sub").textContent = s.label;
     c.append(h2);
     const st = document.createElement("div"); st.className = "stats"; c.append(st);
-    const rec = { st, badge: h2.querySelector(".sbad"), sparks: [
-      makeSpark(c, "Prompt processing", "s"+s.id+".prompt_tps", "t/s", "#0969da"),
-      makeSpark(c, "Generation", "s"+s.id+".gen_tps", "t/s", "#1a7f37"),
-      makeSpark(c, "Generation (wall clock)", "s"+s.id+".gen_wall", "t/s", "#8250df")]};
+    const rec = { st, knd: h2.querySelector(".knd"), badge: h2.querySelector(".sbad"), sparks: [
+      makeSpark(c, "Prompt processing", "s"+s.id+".prompt_wall", "t/s",
+                "#0969da", { min: 0 }),
+      makeSpark(c, "Generation", "s"+s.id+".gen_wall", "t/s",
+                "#1a7f37", { min: 0 })]};
     servers[s.id] = rec; grid.append(c);
   });
   d.gpus.forEach(g => {
@@ -552,10 +713,11 @@ function build(d){
     c.append(h2);
     const st = document.createElement("div"); st.className = "stats"; c.append(st);
     const rec = { st, sparks: [
-      makeSpark(c, "Temperature", "g"+i+".temp", "°C", "#cf222e", { d: 0 }),
-      makeSpark(c, "GPU utilization", "g"+i+".util", "%", "#0969da", { d: 0 }),
-      makeSpark(c, "VRAM", "g"+i+".mem_pct", "%", "#8250df", { d: 0 }),
-      makeSpark(c, "Power", "g"+i+".power", "W", "#bf8700"),
+      makeSpark(c, "Temperature", "g"+i+".temp", "°C", "#cf222e", { d: 0, min: 0, max: 90 }),
+      makeSpark(c, "GPU utilization", "g"+i+".util", "%", "#0969da", { d: 0, min: 0, max: 100 }),
+      makeSpark(c, "VRAM", "g"+i+".mem_pct", "%", "#8250df", { d: 0, min: 0, max: 100 }),
+      makeSpark(c, "Power", "g"+i+".power", "W", "#bf8700",
+                { min: 0, max: g.power_limit || null }),
       makeSpark(c, "PCIe AER (rate /min + cumulative)", "g"+i+".aer_rate", "/min",
                 "#cf222e", { extra: "g"+i+".aer_cum" })]};
     gpus[i] = rec; grid.append(c);
@@ -567,7 +729,7 @@ function build(d){
     c.append(h2);
     const st = document.createElement("div"); st.className = "stats"; c.append(st);
     host.rec = { st, hs: h2.querySelector(".hs"), sparks: [
-      makeSpark(c, "CPU", "h.cpu", "%", "#0969da"),
+      makeSpark(c, "CPU", "h.cpu", "%", "#0969da", { min: 0, max: 100 }),
       makeSpark(c, "RAM used", "h.ram", "GB", "#1a7f37"),
       makeSpark(c, "Network (rx + tx)", "h.rx", "MB/s", "#0e7490", { extra: "h.tx" })]};
     grid.append(c);
@@ -588,13 +750,25 @@ function update(d){
     " · monitor up "+fmtUptime(d.monitor_uptime);
   d.servers.forEach(s => {
     const r = refs.servers[s.id]; if (!r) return;
+    r.knd.textContent = s.kind === "strata" ? "Strata"
+                        : s.kind === "llama" ? "llama-server" : "endpoint";
     r.badge.innerHTML = s.up
       ? '<span class="badge up">UP</span>'+(s.model ? ' <span class="sub">'+esc(s.model)+"</span>" : "")
       : '<span class="badge down">DOWN</span>';
-    setStat(r.st, "requests", statVal(ser, "s"+s.id+".req_proc", null, 0, false));
-    setStat(r.st, "deferred", statVal(ser, "s"+s.id+".req_def", null, 0, false));
-    setStat(r.st, "max seq", statVal(ser, "s"+s.id+".seq_max", "tok", 0, false));
-    setStat(r.st, "spec accept", statVal(ser, "s"+s.id+".spec_acc", "%"));
+    const L = k => lastv(ser, "s"+s.id+"."+k);
+    const num = (v, u, d) => v == null ? "\u2013" : v.toFixed(d) + (u ? " "+u : "");
+    const intg = v => v == null ? "\u2013" : String(Math.round(v));
+    setStat(r.st, "requests", intg(L("req_proc")));
+    setStat(r.st, "queued", intg(L("req_def")));
+    setStat(r.st, "max seq", L("seq_max") == null ? "\u2013" : fmtK(L("seq_max"))+" tok");
+    setStat(r.st, "spec accept", num(L("spec_acc"), "%", 0));
+    setStat(r.st, "cache hit", num(L("cache_pct"), "%", 0));
+    const pt = L("prompt_tps"), ptok = L("last_prompt_tok");
+    setStat(r.st, "prefill", pt == null ? "\u2013"
+      : pt.toFixed(0)+" t/s"+(ptok != null ? " ("+fmtK(ptok)+" tok)" : ""));
+    const gt = L("gen_tps"), gtok = L("last_decode_tok");
+    setStat(r.st, "decode", gt == null ? "\u2013"
+      : gt.toFixed(0)+" t/s"+(gtok != null ? " ("+fmtK(gtok)+" tok)" : ""));
   });
   d.gpus.forEach(g => {
     const r = refs.gpus[g.id]; if (!r) return;

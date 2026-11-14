@@ -12,17 +12,19 @@
 #   rc-update add strata default  # start at boot
 
 name="Strata inference server"
-description="Strata (llama.cpp-compatible OpenAI API) on the local V100"
+description="Strata (llama.cpp-compatible OpenAI API) on the local V100s"
 
 extra_commands="models"
 extra_started_commands="health"
 
 : "${STRATA_REPO:=/mnt/git/local-llama-cpp}"
-: "${STRATA_MODEL:=coder-iq1_m}"
+: "${STRATA_MODEL:=unsloth-ud-q4_k_xl}"
 : "${STRATA_PORT:=8080}"
 : "${STRATA_USER:=juha}"
 : "${STRATA_NUMA_NODE:=1}"
 : "${STRATA_GPU_UUID:=}"
+: "${STRATA_GPU_UUIDS:=$STRATA_GPU_UUID}"
+: "${STRATA_POWER_LIMIT_W:=}"
 : "${STRATA_EXTRA_ARGS:=}"
 : "${STRATA_START_TIMEOUT:=300}"
 : "${STRATA_STOP_TIMEOUT:=120}"
@@ -65,19 +67,55 @@ strata_pid_alive() {
 	[ -r "$pidfile" ] && kill -0 "$(cat "$pidfile")" 2>/dev/null
 }
 
-# The GPU is selected by index in the config; indices have moved before (the
-# two V100s were swapped between slots), so refuse to start on the wrong card.
+# Match the configured physical indices to UUIDs in stage order. The old
+# STRATA_GPU_UUID setting is still accepted for single-GPU configurations.
 strata_check_gpu() {
-	[ -n "$STRATA_GPU_UUID" ] || return 0
-	local idx uuid
-	idx=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("gpu", ""))' "$strata_config") || return 1
-	uuid=$(nvidia-smi --query-gpu=index,uuid --format=csv,noheader 2>/dev/null |
-		awk -F', *' -v i="$idx" '$1 == i { print $2 }')
-	if [ "$uuid" != "$STRATA_GPU_UUID" ]; then
-		eerror "GPU index ${idx} in ${strata_config##*/} is '${uuid:-missing}', expected ${STRATA_GPU_UUID}"
-		eerror "Fix the gpu index in the config or STRATA_GPU_UUID in /etc/conf.d/strata"
+	[ -n "$STRATA_GPU_UUIDS" ] || return 0
+	local configured actual idx uuid
+	configured=$(python3 -c '
+import json, sys
+gpu = json.load(open(sys.argv[1]))["gpu"]
+gpus = gpu if isinstance(gpu, list) else [gpu]
+if not gpus or any(type(i) is not int or i < 0 for i in gpus):
+    sys.exit("gpu must be a non-empty list of indices or a single index")
+print(",".join(map(str, gpus)))
+' "$strata_config") || return 1
+	actual=""
+	for uuid in $STRATA_GPU_UUIDS; do
+		idx=$(nvidia-smi -i "$uuid" --query-gpu=index --format=csv,noheader,nounits) || {
+			eerror "Cannot find GPU ${uuid}"
+			return 1
+		}
+		case "$idx" in
+			''|*[!0-9]*) eerror "Invalid GPU index for ${uuid}: ${idx}"; return 1 ;;
+		esac
+		actual="${actual:+${actual},}${idx}"
+	done
+	if [ "$configured" != "$actual" ]; then
+		eerror "GPU indices in ${strata_config##*/} are ${configured}, UUIDs map to ${actual:-none}"
+		eerror "Fix the config or STRATA_GPU_UUIDS in /etc/conf.d/strata"
 		return 1
 	fi
+}
+
+# OpenRC runs this as root, before dropping privileges for the server. Limits
+# are global to the cards and remain until changed or the driver is reloaded.
+strata_set_power_limit() {
+	[ -n "$STRATA_POWER_LIMIT_W" ] || return 0
+	case "$STRATA_POWER_LIMIT_W" in
+		*[!0-9]*|0) eerror "STRATA_POWER_LIMIT_W must be a positive whole number"; return 1 ;;
+	esac
+	if [ -z "$STRATA_GPU_UUIDS" ]; then
+		eerror "Set STRATA_GPU_UUIDS before setting a power limit"
+		return 1
+	fi
+	local uuid
+	for uuid in $STRATA_GPU_UUIDS; do
+		if ! nvidia-smi -i "$uuid" -pl "$STRATA_POWER_LIMIT_W"; then
+			eerror "Failed to set ${uuid} to ${STRATA_POWER_LIMIT_W} W; earlier GPUs may already have changed"
+			return 1
+		fi
+	done
 }
 
 start_pre() {
@@ -95,6 +133,7 @@ start_pre() {
 		return 1
 	fi
 	strata_check_gpu || return 1
+	strata_set_power_limit || return 1
 	checkpath -d -m 0755 -o "${STRATA_USER}" "$logdir"
 }
 

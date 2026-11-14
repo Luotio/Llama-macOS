@@ -1,7 +1,26 @@
 #!/bin/sh
-# NUMA: the healthy V100 (UUID GPU-40faaa73-..., nvidia-smi index 1 as of 2026-10-18) sits on node 1 (CPUs 16-31,48-63).
-# Bind the whole server to node 1 so the host thread, pool workers and first-touch
-# page cache are local to the GPU's PCIe root; overflow beyond node 1's 48 GB
-# falls back to node 0 automatically. The engine's CPU pool honors this mask.
-cd "/mnt/git/local-llama-cpp/strata"
-exec numactl --cpunodebind=1 "/mnt/git/local-llama-cpp/strata/.venv/bin/python" "/mnt/git/local-llama-cpp/strata/serve/server.py" "--engine" "strata" "--config" "/mnt/git/local-llama-cpp/local/strata/strata-unsloth-ud-q4_k_xl.json" "--port" "8080" "--open"
+# Both V100s are on NUMA node 1; memory can fall back to node 0.
+# The split and cache sizes are based on Coder measurements, not Q4 benchmarks.
+set -eu
+repo="$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)"
+config="$repo/local/strata/strata-unsloth-ud-q4_k_xl.json"
+python="$repo/strata/.venv/bin/python"
+expected_1="GPU-e487578c-0be1-8c0b-ad8b-0ab0615c4850"
+expected_2="GPU-40faaa73-acef-a2eb-1f38-7b96df067d5c"
+
+# The config names physical nvidia-smi indices, so check both its order and
+# the UUID at each index before the server maps them into CUDA device order.
+if ! "$python" -c 'import json, sys; c = json.load(open(sys.argv[1])); sys.exit(0 if c.get("gpu") == [1, 2] and c.get("gpu_order") == "as_given" else 1)' "$config"; then
+	echo "Unexpected GPU order in $config; update the launcher guard and config together." >&2
+	exit 1
+fi
+actual_1="$(nvidia-smi -i "$expected_1" --query-gpu=index --format=csv,noheader,nounits)"
+actual_2="$(nvidia-smi -i "$expected_2" --query-gpu=index --format=csv,noheader,nounits)"
+if [ "$actual_1" != 1 ] || [ "$actual_2" != 2 ]; then
+	echo "GPU indices changed: $expected_1=$actual_1, $expected_2=$actual_2; update the launcher guard and config together." >&2
+	exit 1
+fi
+
+cd "$repo/strata"
+exec numactl --cpunodebind=1 "$python" "$repo/strata/serve/server.py" \
+	--engine strata --config "$config" --port "${PORT:-8080}" --open

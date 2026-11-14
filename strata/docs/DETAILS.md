@@ -478,6 +478,7 @@ applies at the next start. Network, key, MCP and program keys are not editable t
 | `prevent_sleep` | off | Windows only: keeps the PC awake while a request runs or waits (`SetThreadExecutionState`). On Linux and macOS one startup line says it does nothing. |
 | `sampling` | the model card | Defaults for requests that leave sampling fields out, for example `{"temperature": 1.0, "top_p": 0.95, "top_k": 20}`. |
 | `aliases` | none | Extra model names listed in `/v1/models`, like llama-server's `--alias`. Any other name is still served. |
+| `system_prompt` | none | A string prepended as a system message to every non-empty chat. Client system and developer instructions stay in place; the exposed chat template includes this prefix. Takes effect at the next start. |
 | `fit_max_tokens` | `true` | A request whose `max_tokens` runs past the context gets it shortened to the room left. `false` (or `--no-fit-max-tokens`) returns 400 instead. A prompt that leaves no room is always refused. |
 | `engine_silence_s` | `300` | Ends the engine after this many seconds without a line during a request (`0` = wait forever). While a prompt is read, each chunk may take three times the previous one's time. |
 | `parallel` | `1` | Up to N requests decoded together in batch slots ([BATCHING.md](BATCHING.md)). |
