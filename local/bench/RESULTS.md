@@ -1,5 +1,34 @@
 # Qwen3.8-27B and Qwen3.8-Flash-Next performance results
 
+## Qwen3.8-27B: experimental single-agent settings (2026-11-14)
+
+The initial single-agent trial enabled metrics and used batch/ubatch 1536,
+64 context checkpoints, 2048-token minimum checkpoint spacing and a
+16384 MiB RAM prompt snapshot limit. These are experimental changes, not a
+measured speed improvement. The prior 1024/1024, 32-checkpoint, 8192-step,
+4096 MiB settings remain available via launcher environment overrides.
+
+On an isolated 131072-context server, an eight-token generation returned HTTP
+200 and the metrics endpoint exposed prompt, generation and MTP counters.
+One 2048-token retrieval smoke test consumed all tokens without truncation,
+retrieved all three facts and generated 22 tokens: 1064.14 prompt tok/s,
+74.44 decode tok/s, 2.45 s wall. After the test, GPUs used 15303/15302 MiB,
+with 842/843 MiB free. This single short test does not establish 128K
+capacity under load, long-agent quality, endurance or an A/B performance win.
+The temporary test server was stopped; MTP depth remains 2 and its probability
+threshold was not changed.
+
+After the user's real agent session, metrics at one idle snapshot showed
+72098 prompt tokens in 91.4926 s, 8215 generated tokens in 195.292 s,
+4770/6886 accepted draft tokens, and a context high-water mark of 80311.
+These are cumulative session counters, not a controlled benchmark.
+
+Next A/B trial: the launcher now defaults to batch 1536 / ubatch 1024; all
+other single-agent settings remain unchanged. Set UBATCH_SIZE=1536 to restore
+the initial agent trial. The 1024 microbatch trial has not yet been run or
+validated at 128K, and the running process retains its original settings until
+restarted. Compare matched workloads and results before choosing a winner.
+
 ## Qwen3.8-27B: V100 native NCCL tensor profile (2026-11-13)
 
 Isolated Release build from `local/build-27b-v100.sh`: Broadwell native CPU,

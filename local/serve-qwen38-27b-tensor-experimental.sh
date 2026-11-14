@@ -5,6 +5,12 @@
 # Original V100 link logs very large numbers of correctable AER errors and
 # the card thermally throttled at its 83 C maximum operating temperature.
 # Tensor mode requires unquantized KV and has limited VRAM headroom.
+# Experimental agent settings: batch 1536, ubatch 1024, 64 checkpoints,
+# 2048-token checkpoint spacing, 16 GiB prompt snapshot limit and metrics.
+# This is an unvalidated A/B test against the previous agent profile; set
+# UBATCH_SIZE=1536 to restore that profile. The earlier measured settings can
+# be restored with BATCH_SIZE=1024 UBATCH_SIZE=1024 CTX_CHECKPOINTS=32
+# CHECKPOINT_MIN_STEP=8192 CACHE_RAM_MIB=4096.
 set -euo pipefail
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 gpu1="GPU-e487578c-0be1-8c0b-ad8b-0ab0615c4850"
@@ -17,7 +23,10 @@ exec numactl --cpunodebind=1 "${SERVER_BIN:-$repo/llama-cpp/build-v100-nccl/bin/
     --model "$repo/local/models/Qwen3.8-27B-UD-Q4_K_XL.gguf" \
     --host "${HOST:-127.0.0.1}" --port "${PORT:-8080}" \
     --ctx-size "${CTX_SIZE:-131072}" --n-gpu-layers 999 --split-mode tensor \
-    --tensor-split 1,1 --fit off --flash-attn on --batch-size 1024 --ubatch-size 1024 \
+    --tensor-split 1,1 --fit off --flash-attn on \
+    --batch-size "${BATCH_SIZE:-1536}" --ubatch-size "${UBATCH_SIZE:-1024}" \
     --cache-type-k f16 --cache-type-v f16 --spec-type draft-mtp \
     --spec-draft-n-max 2 --spec-draft-type-k f16 --spec-draft-type-v f16 \
-    --parallel 1 --threads 8 --jinja --kv-unified --cache-ram 4096 --load-mode none "$@"
+    --parallel 1 --threads 8 --jinja --kv-unified --metrics \
+    --ctx-checkpoints "${CTX_CHECKPOINTS:-64}" --checkpoint-min-step "${CHECKPOINT_MIN_STEP:-2048}" \
+    --cache-ram "${CACHE_RAM_MIB:-16384}" --load-mode none "$@"
