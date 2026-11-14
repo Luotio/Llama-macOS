@@ -1,5 +1,135 @@
 # Qwen3.8-27B and Qwen3.8-Flash-Next performance results
 
+## Qwen3.8-27B: V100 native NCCL tensor profile (2026-11-13)
+
+Isolated Release build from `local/build-27b-v100.sh`: Broadwell native CPU,
+CUDA 12.9, sm70, CUDA graphs and NCCL 2.27.7. Server reports build 11601,
+commit 42e928fd48, unlike the older binary (11577, b611fc7fa7); its SHA256 is
+703703a1dd1f06d8fd26cbb5325d915ca779e240528ee7c5d3b05ca64128c71a and
+the CUDA library SHA256 is
+e914ddf4c31acb25f717cce6116479ddeff65b9b113814f654a4e626503545f6.
+NCCL initialized both ranks;
+its topology log showed NVLink and 12 direct P2P ring channels. Using 131072
+context, f16 target/draft KV, MTP2 and 1:1 tensor split, the exact 130048-token
+retrieval probe evaluated all tokens without truncation and retrieved all
+three facts, then generated 22 tokens. Prompt 460.15 tok/s, decode 39.96
+tok/s, 284.96 s wall. This is one synthetic example, not general 128K quality
+or endurance validation. A 16384-token retrieval also passed, 1041.55 prompt
+tok/s. Three capped short coding probes averaged 69.27 tok/s (69.21, 70.22,
+68.38; MTP acceptance 434/656); these are not completed-task quality scores.
+The 4-case direct tool smoke scored 3/4: it chose to read before editing.
+After the long run the GPUs each used 14329 MiB, original reached 81 C and
+both had zero uncorrectable volatile ECC. The original root port accumulated
+301479 and its endpoint 262598 correctable AER errors during that request.
+This serious existing PCIe fault leaves sustained reliability uncertain.
+This run used ubatch 512; the current launcher later changed to 1024, as
+described below. The layer launcher remains a fallback. Tensor parallelism
+is experimental.
+
+Matched new-build internal AllReduce comparison with otherwise identical
+server flags and requests: 2K retrieval 639.68 prompt tok/s, 16K retrieval
+598.27 prompt tok/s, three capped coding probes 58.33, 57.05, 58.27 (mean
+57.88) decode tok/s; both retrievals got all three facts and 439/651 draft
+tokens were accepted on coding. NCCL scored 886.45 at 2K, 1041.55 at 16K,
+and 69.27 on short decode. Each 16K result is a single run, not a statistical
+estimate. Different acceptance counts show execution paths can differ
+numerically; retrieval alone does not establish output equivalence. Internal
+used about 13837 MiB per V100 vs NCCL's 14329 MiB after graph capture.
+
+Guarded short sweep (`local/bench/tensor-sweep.py`), all at 131072 allocated
+context: MTP 1/2/3/4 produced short coding means 59.88/65.90/62.67/59.73
+tok/s respectively. All four passed 8K three-fact retrieval. Another sweep
+bracketed with baseline MTP2 produced 61.44 and 60.34 tok/s coding and 984.95
+and 959.43 prompt tok/s at 8K. Four threads gave 59.67/953.59; 16 threads
+60.13/961.04; ubatch 256 gave 58.75/739.64; ubatch 1024 gave 59.42/1032.63;
+4x launch queue gave 59.56/930.06 (coding/prompt tok/s). Each prompt timing
+is one observation and baseline drift is visible. The 1024 microbatch looks
+promising for 8K prompt speed but used 14829 MiB per GPU and had not yet been
+validated near 128K. The 8-thread/MTP2 baseline remains
+best-supported; no option is claimed optimal from these small samples. Peak
+observed GPU temperature across sweeps was 81 C, uncorrectable ECC remained
+zero; each case incurred tens of thousands of correctable AER errors. Original
+baseline result file in the second sweep was overwritten by its repeated final
+case; both aggregate results are reported above and the harness now uses
+unique filenames for repeats.
+
+Subsequent guarded near-limit test with ubatch 1024 evaluated 130048 tokens,
+retrieved all three facts and generated 22 tokens without truncation. Prompt
+508.72 tok/s, 256.26 s wall versus the prior 512 microbatch's 460.15 tok/s,
+284.96 s wall; these are single runs at different times, not repeated A/B
+statistics. Peak allocation was 14829 MiB per V100; only about 1316 MiB was
+free per card. The subsequent three short coding probes averaged 49.72 tok/s
+after the long load, so performance depends strongly on sustained conditions.
+The original GPU reached its reported 83 C maximum operating temperature;
+GPU telemetry observed software or hardware thermal slowdown in 31 of 97
+samples. The minimum sampled SM clock was 442 MHz, but that particular sample
+did not report a thermal-throttle reason. Peak replacement temperature was
+also 83 C. Root/endpoint
+AER totals rose 311126/234375 across the entire case; uncorrectable ECC stayed
+zero. This is a hardware cooling and PCIe reliability problem, not an optimal
+steady-state configuration. The experimental launcher now saves ubatch 1024
+as the fastest measured near-limit profile; 512 remains a lower-VRAM fallback.
+The sweep guard now stops at 82 C or thermal slowdown instead of 85 C. Avoid
+further sustained loads until airflow and the faulty PCIe path are repaired.
+
+## Qwen3.8-27B: near-128K retrieval baseline (2026-11-13)
+
+Model SHA256: 3f227079003add2511437e5b1e94812e363385225bf6a9b47b0054a72bc8b01e.
+Baseline server SHA256: eb3a493c88b177d996ba9d19876ac53a8b2ecf3283953624f614013dc2a71cf8.
+Existing 60:40 layer launcher, target q8_0 and draft q4_0 KV, MTP2,
+131072-token context. `local/bench/long-context-probe.py` sent exactly 130048
+prompt tokens, with three deployment codes at token positions 6582, 65045 and
+123508. The server reported 130048 evaluated, no truncation, 22 generated
+tokens, and retrieved all three correctly. It took 291.32 s wall, 448.32
+prompt tok/s and 27.71 decode tok/s; the output is a short synthetic retrieval
+test, not a coding or general long-context quality benchmark. A separate
+CUDA build was running concurrently, so timing is not a controlled comparison.
+The original GPU reached 80 C; its root port added 163412 and endpoint 273687
+correctable AER errors during the request, while uncorrectable GPU ECC stayed
+zero. This test does not establish hardware reliability; reduce repeated long
+stress and monitor temperatures and counters.
+
+Research: llama.cpp's multi-GPU guide documents tensor mode as experimental,
+requiring flash attention and unquantized KV; it recommends NCCL or P2P with
+appropriate correctness checks. NVIDIA warns that multiple GPUs per process
+using NCCL and CUDA graphs can deadlock. Local source has an alternative
+internal two-GPU AllReduce that stages via host memory. Links:
+https://github.com/ggml-org/llama.cpp/blob/master/docs/multi-gpu.md
+https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/usage/cudagraph.html
+
+Tensor follow-up: the existing binary with 131072 context, f16 target/draft
+KV, MTP2, batch 1024/ubatch 512, 1:1 split and internal AllReduce started
+without fit and handled the 2048-token retrieval smoke test, 3/3 facts. Three
+256-token capped coding speed probes averaged 68.21 tok/s (67.58, 68.20,
+68.85; 439/651 draft accepted). This was concurrent with compilation, and
+settings differ from the layer server, so it is not a controlled comparison.
+The direct tool-call smoke test passed 3/4; for the edit case it read the file
+instead of issuing the directly requested edit. No actual agent task was run.
+After these short requests the two cards each had 2316 MiB free, uncorrectable
+ECC zero, and the original was 77 C. At that point long prompt inference had
+not yet been validated for tensor mode; later NCCL results are reported above.
+
+## Qwen3.8-27B: tensor-parallel smoke test (2026-11-13)
+
+llama-bench b611fc7fa7, both V100s selected by UUID, NUMA node 1, 8 threads,
+`-sm tensor -ts 1/1 -ngl 99 -fa on -ctk f16 -ctv f16`, pp128/tg32,
+one repetition, no MTP: 513.64 prompt tok/s, 46.83 decode tok/s. The build has
+NCCL enabled in configuration but its headers and library were not found.
+Tensor-mode llama-server with 8192 context, f16 target and draft KV, MTP max
+2, and 1:1 split completed the same three capped coding speed probes at
+71.68, 72.61 and 75.42 tok/s (mean 73.24, 441/647 accepted), with about
+6818 MiB free on each V100. Launcher:
+`local/serve-qwen38-27b-tensor-experimental.sh`. These are short speed probes,
+not correctness or agent tests. They are not a controlled comparison with the
+128K layer benchmark: context, KV precision, sampling defaults and other
+settings differ. At that point long context, full 128K capacity and task
+quality remained untested; later NCCL results are reported above. Tensor mode
+is experimental and may OOM when context grows.
+Important: llama-bench's per-GPU separator is `/`; `-ts 1,1` runs two separate
+one-GPU splits, not a 50:50 split (the 99-layer attempt OOMed). The server's
+`--tensor-split` uses commas instead. Quantized KV is not supported in tensor
+mode; the production layer-split launcher is unchanged.
+
 ## Qwen3.8-27B: llama-server 128K configuration (2026-11-13)
 
 Launcher: `local/serve-qwen38-27b-dual.sh`. Baseline settings: 131072

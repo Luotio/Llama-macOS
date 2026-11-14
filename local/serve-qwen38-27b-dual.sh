@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Qwen3.8-27B, two V100s, llama.cpp. Measurements: local/bench/RESULTS.md.
 # The original V100 link reports many correctable PCIe errors under load.
-# 128K allocation starts successfully, but full-length inference is untested.
+# 130048 prompt tokens plus 22 generated tokens passed a retrieval smoke test;
+# this is not a full agent-quality or sustained-reliability validation.
 # Local-only by default. Override HOST, PORT, THREADS, SPEC_TYPE, DRAFT_MAX,
 # CACHE_RAM_MIB or TENSOR_SPLIT. GPU UUIDs deliberately exclude the GTX 1080.
 set -euo pipefail
