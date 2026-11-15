@@ -93,29 +93,53 @@ Flash-Next recipe on this box: `--n-cpu-moe 999 -ot 'per_layer_token_embd=CPU' -
 
 `local/monitor/monitor.py` - Python 3 stdlib only, in-memory only (nothing
 written to disk). Dark-theme dashboard with 10-minute sparklines: one card per
-llama-server, one per GPU, plus a host card.
+llama-server/Strata backend, one per GPU, a spot-price card, plus a host card.
+Full docs: `local/monitor/README.md`; config schema:
+`local/monitor/config.example.json`.
 
 - server: prompt tokens/s (busy), generation tokens/s (busy + wall clock),
   spec-decode accept %, requests in flight, longest sequence
-- GPU (all cards by default, UUID filter via MON_GPUS): temperature,
-  utilization, VRAM used/total, power draw/limit, PCIe link Gen x width, and
-  PCIe AER correctable errors as rate/min + cumulative on one dual-axis
-  sparkline (GPU side and the upstream root port, so both link directions)
+- GPU (visibility filter `gpus` in config or MON_GPUS; this box shows only
+  the two V100s): temperature, utilization, VRAM used/total, power draw,
+  power-limit (cap) sparkline, PCIe link Gen x width, and PCIe AER
+  correctable errors as rate/min + cumulative on one dual-axis sparkline
+  (GPU side and the upstream root port, so both link directions). AMD cards
+  are supported via sysfs (no ROCm needed); path written blind - no AMD
+  hardware here.
+- price/throttle: FI Nord Pool day-ahead spot prices (Spotwatts primary,
+  Volton fallback, in-memory cache covering now..now+24h) charted with a
+  threshold line; when `throttle.enabled`, above-threshold MTU prices set
+  the configured GPUs to their minimum power cap and cheaper hours restore
+  them (`restore_watts`, e.g. 250 W per V100). Cap writes need root: run
+  the service as root or use the sudoers drop-in.
 - host: CPU %, load 1/5/15, RAM, swap, network rx + tx, uptime
 
-Data sources: llama-server `/metrics` + `/v1/models` (per MON_URLS), one
-nvidia-smi call per cycle for all cards, /proc for host stats. 2 s poll,
-1800 s window by default. JSON at `/api/stats`, liveness at `/healthz`.
+Config precedence: defaults < JSON file (`--config`, `$MON_CONFIG`, else
+`/etc/llama-mon/config.json`) < MON_* env (OpenRC conf.d keeps working).
+Data sources: llama-server `/metrics` + `/v1/models` (Strata auto-detected
+via `/health`), one nvidia-smi call per cycle for all cards, /proc for host
+stats. 2 s poll, 1800 s window by default. JSON at `/api/stats` (includes
+`price` + `throttle` blocks), liveness at `/healthz`.
 
 - Dashboard: `http://127.0.0.1:8085/`
-- OpenRC service: `sudo local/openrc/llama-mon-install.sh` installs, enables
-  at boot (default runlevel) and starts. Manage with `rc-service llama-mon
-  start|stop|restart|status|health`. Config: `/etc/conf.d/llama-mon`
-  (template `local/openrc/llama-mon.confd`: MON_HOST, MON_PORT, MON_URLS,
-  MON_INTERVAL, MON_WINDOW, MON_GPUS, MON_USER). Log:
+- systemd service (recommended): `sudo local/systemd/install.sh [--restart]`
+  COPIES the code to `/opt/llama-mon/` (service never runs from the repo) and
+  seeds `/etc/llama-mon/config.json` once from the repo template. Manage with
+  `systemctl llama-mon start|stop|restart|status` + `journalctl -u llama-mon`.
+  `DESTDIR=/tmp/stage` dry-runs; `--uninstall` removes unit + copied code.
+  Refuses to co-exist with a running OpenRC llama-mon (same port).
+- OpenRC service (this box's init system; runs from the checkout):
+  `sudo local/openrc/llama-mon-install.sh [--restart|--force-conf|--uninstall]`
+  installs, enables at boot (default runlevel) and starts, and seeds
+  `/etc/llama-mon/config.json` once from the repo template like the systemd
+  installer. Manage with `rc-service llama-mon start|stop|restart|status|
+  health`. `/etc/conf.d/llama-mon` keeps only MON_REPO + MON_USER (default
+  **root** - needed for throttle cap writes) plus optional MON_* overrides
+  that win over the JSON file when uncommented. Log:
   /var/log/llama-mon/monitor.log
 - Ad hoc without the service:
-  `MON_PORT=8085 MON_URLS=http://127.0.0.1:8080 python3 local/monitor/monitor.py`
+  `python3 local/monitor/monitor.py --config local/monitor/config.example.json`
+  (or MON_* env as before)
 
 ## Results and conventions
 

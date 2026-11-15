@@ -4,12 +4,13 @@
 #
 #   sudo local/openrc/llama-mon-install.sh             install + enable + start
 #   sudo local/openrc/llama-mon-install.sh --restart   restart a running service
-#   sudo local/openrc/llama-mon-install.sh --force-conf  overwrite conf.d
+#   sudo local/openrc/llama-mon-install.sh --force-conf  overwrite conf.d + JSON config
 #   sudo local/openrc/llama-mon-install.sh --uninstall stop, remove runlevel entry
 #
 # Re-running is the update path: the init script is always replaced;
-# /etc/conf.d/llama-mon is only created when missing, and a diff against the
-# repo template is shown when it differs.
+# /etc/conf.d/llama-mon and /etc/llama-mon/config.json (the monitor's main
+# JSON config, schema: local/monitor/README.md) are only created when
+# missing, and diffs against the repo templates are shown when they differ.
 #
 # DESTDIR=/some/dir stages into a directory instead of the live system (testing).
 set -euo pipefail
@@ -19,6 +20,8 @@ REPO_ROOT="$(cd "$SRC/../.." && pwd)"
 DESTDIR="${DESTDIR:-}"
 INITD="$DESTDIR/etc/init.d/llama-mon"
 CONFD="$DESTDIR/etc/conf.d/llama-mon"
+JSONC="$DESTDIR/etc/llama-mon/config.json"
+CONF_TEMPLATE="$REPO_ROOT/local/monitor/config.example.json"
 
 RESTART=0 FORCE_CONF=0 UNINSTALL=0
 for arg in "$@"; do
@@ -44,7 +47,7 @@ if [[ $UNINSTALL -eq 1 ]]; then
         rc-update del llama-mon 2>/dev/null || true
     fi
     rm -f "$INITD"
-    echo "[llama-mon] removed $INITD (conf.d kept; delete $CONFD manually if wanted)"
+    echo "[llama-mon] removed $INITD ($CONFD and $JSONC kept; delete them manually if wanted)"
     exit 0
 fi
 
@@ -69,6 +72,18 @@ elif ! diff -q "$TMP_CONF" "$CONFD" >/dev/null; then
     diff -u "$CONFD" "$TMP_CONF" || true
 else
     echo "[llama-mon] $CONFD is up to date"
+fi
+
+# The monitor's main JSON config (GPU visibility, price sources, throttle).
+mkdir -p "$(dirname "$JSONC")"
+if [[ ! -e "$JSONC" || $FORCE_CONF -eq 1 ]]; then
+    install -m 0644 "$CONF_TEMPLATE" "$JSONC"
+    echo "[llama-mon] wrote $JSONC (edit it, then: rc-service llama-mon restart)"
+elif ! diff -q "$CONF_TEMPLATE" "$JSONC" >/dev/null; then
+    echo "[llama-mon] kept your $JSONC (differs from the repo template; --force-conf overwrites):"
+    diff -u "$JSONC" "$CONF_TEMPLATE" || true
+else
+    echo "[llama-mon] $JSONC is up to date"
 fi
 
 if live; then

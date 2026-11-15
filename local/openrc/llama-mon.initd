@@ -1,29 +1,26 @@
 #!/sbin/openrc-run
-# OpenRC service for the in-memory llama.cpp monitor.
+# OpenRC service for the in-memory llama.cpp monitor + Nord Pool spot-price
+# GPU power throttle.
 #
 # Installed to /etc/init.d/llama-mon by local/openrc/llama-mon-install.sh.
 # The monitor runs straight from the repository checkout:
-# local/monitor/monitor.py (Python 3 stdlib only, no venv needed). The port,
-# the polled servers, the poll interval and the GPU selection live in
-# /etc/conf.d/llama-mon.
+# local/monitor/monitor.py (Python 3 stdlib only, no venv needed). Its main
+# configuration is the JSON file /etc/llama-mon/config.json (schema:
+# local/monitor/README.md); the MON_* variables in /etc/conf.d/llama-mon are
+# optional overrides - only ones actually set there reach the process.
 #
 #   rc-service llama-mon start | stop | restart | status
 #   rc-service llama-mon health      # ask the running monitor for /healthz
 #   rc-update add llama-mon default  # start at boot
 
 name="llama.cpp monitor"
-description="In-memory sparkline monitor for llama-server, GPUs and host"
+description="In-memory sparkline monitor for llama-server, GPUs, host (+ spot-price GPU throttle)"
 
 extra_started_commands="health"
 
 : "${MON_REPO:=/mnt/git/local-llama-cpp}"
-: "${MON_HOST:=127.0.0.1}"
-: "${MON_PORT:=8085}"
-: "${MON_URLS:=http://127.0.0.1:8080}"
-: "${MON_INTERVAL:=2}"
-: "${MON_WINDOW:=1800}"
-: "${MON_GPUS:=}"
-: "${MON_USER:=juha}"
+# Setting GPU power caps (nvidia-smi -pl) needs root; keep the default root.
+: "${MON_USER:=root}"
 
 monitor_py="${MON_REPO}/local/monitor/monitor.py"
 monitor_python="/usr/bin/python3"
@@ -37,7 +34,7 @@ depend() {
 }
 
 health() {
-	curl -fsS --max-time 5 "http://${MON_HOST}:${MON_PORT}/healthz"
+	curl -fsS --max-time 5 "http://${MON_HOST:-127.0.0.1}:${MON_PORT:-8085}/healthz"
 	echo
 }
 
@@ -50,18 +47,23 @@ start_pre() {
 		eerror "Monitor not found: ${monitor_py}"
 		return 1
 	fi
-	if ss -Hltn "sport = :${MON_PORT}" 2>/dev/null | grep -q .; then
-		eerror "Port ${MON_PORT} is already in use (a manually started monitor?)"
+	if ss -Hltn "sport = :${MON_PORT:-8085}" 2>/dev/null | grep -q .; then
+		eerror "Port ${MON_PORT:-8085} is already in use (a manually started monitor?)"
 		return 1
 	fi
 	checkpath -d -m 0755 -o "${MON_USER}" "$logdir"
 }
 
 start() {
-	ebegin "Starting ${name} (port ${MON_PORT}, servers ${MON_URLS})"
-	# Export so start-stop-daemon hands the env to the child; the monitor
-	# reads all MON_* from the environment (see monitor.py).
-	export MON_HOST MON_PORT MON_URLS MON_INTERVAL MON_WINDOW MON_GPUS
+	ebegin "Starting ${name} (port ${MON_PORT:-8085}, servers ${MON_URLS:-http://127.0.0.1:8080})"
+	# Export only the MON_* variables that are non-empty in conf.d: unset or
+	# empty ones must NOT reach the environment, or they would override the
+	# JSON config file (monitor.py precedence: defaults < file < env).
+	# MON_CONFIG exported this way selects an alternative config file path.
+	local v
+	for v in MON_HOST MON_PORT MON_URLS MON_INTERVAL MON_WINDOW MON_GPUS MON_CONFIG; do
+		eval "[ -n \"\${$v:-}\" ]" && export "$v"
+	done
 	start-stop-daemon --start --background --make-pidfile \
 		--pidfile "$pidfile" \
 		--user "$MON_USER" \
@@ -81,7 +83,7 @@ start_post() {
 			eend 1 "monitor exited during start-up, see ${logdir}/monitor.log"
 			return 0
 		fi
-		if curl -fsS --max-time 2 "http://${MON_HOST}:${MON_PORT}/healthz" 2>/dev/null \
+		if curl -fsS --max-time 2 "http://${MON_HOST:-127.0.0.1}:${MON_PORT:-8085}/healthz" 2>/dev/null \
 				| grep -q ok; then
 			eend 0
 			return 0
@@ -103,7 +105,7 @@ stop() {
 
 status() {
 	if mon_pid_alive; then
-		einfo "status: started (pid $(cat "$pidfile"), port ${MON_PORT})"
+		einfo "status: started (pid $(cat "$pidfile"), port ${MON_PORT:-8085})"
 		return 0
 	fi
 	einfo "status: stopped"

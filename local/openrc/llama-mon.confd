@@ -2,25 +2,30 @@
 # Installed by local/openrc/llama-mon-install.sh; an existing copy is never
 # overwritten unless the installer is run with --force-conf. Changes take
 # effect on the next "rc-service llama-mon restart".
+#
+# The monitor's main configuration is the JSON file
+# /etc/llama-mon/config.json (seeded once by the installer; schema:
+# local/monitor/README.md - GPU visibility, spot-price sources and the power
+# throttle live only there). The MON_* variables below are OPTIONAL
+# overrides: only ones uncommented here reach the monitor and win over the
+# JSON file (precedence: built-in defaults < JSON file < environment).
 
 # Checkout the monitor is launched from.
 MON_REPO="@REPO@"
 
-# Address and port the dashboard listens on.
-MON_HOST="127.0.0.1"
-MON_PORT="8085"
+# Unix user the monitor runs as. Setting GPU power caps (the spot-price
+# throttle) needs root, so keep it root unless you installed the sudoers
+# drop-in (local/systemd/llama-mon.sudoers) for an unprivileged user.
+MON_USER="root"
 
+# Optional env overrides (uncomment to force values past the JSON config):
+#MON_HOST="127.0.0.1"
+#MON_PORT="8085"
 # Base URLs of the llama-server instances to poll (space or comma separated;
-# one dashboard card per URL). Each must run with --metrics.
-MON_URLS="http://127.0.0.1:8080"
-
-# Seconds between samples, and how many seconds of history to keep in memory.
-MON_INTERVAL="2"
-MON_WINDOW="1800"
-
-# GPU UUIDs to show (space or comma separated, nvidia-smi --query-gpu=uuid).
-# Empty = all cards.
-MON_GPUS=""
-
-# Unix user the monitor runs as.
-MON_USER="juha"
+# each must run with --metrics; Strata backends are auto-detected).
+#MON_URLS="http://127.0.0.1:8080"
+#MON_INTERVAL="2"
+#MON_WINDOW="1800"
+#MON_GPUS=""
+# Alternative JSON config file path (default /etc/llama-mon/config.json).
+#MON_CONFIG="/etc/llama-mon/config.json"

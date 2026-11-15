@@ -1,30 +1,57 @@
 #!/usr/bin/env python3
-"""llama.cpp + GPU + host monitor with in-memory sparklines.
+"""llama.cpp + GPU + host monitor with in-memory sparklines and a Nord Pool
+spot-price GPU power throttle.
 
 Polls, every MON_INTERVAL seconds:
-  * llama-server /metrics endpoint(s)  (MON_URLS, one or more)
-  * nvidia-smi                         (one call per cycle, all GPUs)
+  * llama-server /metrics endpoint(s)  (urls, one or more)
+  * nvidia-smi                         (one call per cycle, all NVIDIA GPUs)
+  * AMD GPUs via sysfs hwmon (/sys/class/drm/card*/device), augmented with
+    amd-smi JSON output when the ROCm SMIA tool is installed
   * PCIe AER correctable-error counters from sysfs (GPU side AND the
     upstream root port, so both directions of the link are covered)
   * /proc: CPU, RAM, swap, load, network, uptime
 
-A fixed window of samples is kept in memory only; nothing is written to
-disk (except the service log when run under OpenRC). The app serves one
-dashboard page whose canvas sparklines are redrawn by the browser each
-poll cycle.
+Every price.fetch_interval seconds it makes sure the in-memory price table
+covers now .. now+24h for the configured zone (FI by default), fetching the
+missing days from free mirrors of the Nord Pool / SDAC day-ahead clearing
+prices (Spotwatts primary, Volton fallback - Nord Pool's own Market Data API
+needs paid credentials; either mirror serves the identical auction results).
+The dashboard shows a spot-price chart with the threshold line.
 
-Environment (defaults in parentheses, see local/openrc/llama-mon.confd):
+When throttle.enabled, every throttle.interval seconds the price of the
+CURRENT 15-minute market time unit (MTU) is compared against
+threshold_c_per_kwh: above -> each configured GPU gets its minimum power
+limit, at/below -> it is restored to restore_watts ("default" = the driver's
+factory default). Caps are rewritten only when they differ from the target,
+so the loop is quiet most cycles and also repairs caps changed elsewhere.
+Setting caps needs root: run the service as root, or give its user NOPASSWD
+rights for nvidia-smi -pl and tee (see local/systemd/llama-mon.sudoers).
+
+A fixed window of samples is kept in memory only; nothing is written to
+disk (except the service log). The app serves one dashboard page whose
+canvas sparklines are redrawn by the browser each poll cycle.
+
+Configuration precedence: built-in defaults < JSON config file < MON_*
+environment variables (so the OpenRC conf.d keeps working). Config file
+search: --config PATH, $MON_CONFIG, /etc/llama-mon/config.json. The repo
+ships local/monitor/config.example.json; live installs keep theirs in
+/etc/llama-mon/config.json (outside the repo). See README.md there for the
+full schema (gpus visibility filter, price sources, throttle devices).
+
+Environment overrides (defaults in parentheses):
   MON_HOST     bind address                       (127.0.0.1)
   MON_PORT     HTTP port                          (8085)
   MON_URLS     llama-server base URL(s), comma or
                space separated                    (http://127.0.0.1:8080)
   MON_INTERVAL poll interval, seconds             (2)
   MON_WINDOW   history to keep, seconds           (1800)
-  MON_GPUS     GPU UUIDs to show, comma/space sep (all)
+  MON_GPUS     GPU identifiers to show, comma/space separated NVIDIA UUIDs
+               or amd:cardN / amd:BDF ids         (all)
 
 Python 3.9+, standard library only.
 """
 
+import datetime as dt
 import json
 import os
 import re
@@ -35,6 +62,7 @@ import urllib.request
 from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 POINTS = 300  # sparkline points handed to the browser (10 min at 2 s)
 
@@ -242,9 +270,441 @@ class Backend:
             pass
 
 
+# ---------------------------------------------------------------- config
+
+DEFAULTS = {
+    'host': '127.0.0.1',
+    'port': 8085,
+    'urls': ['http://127.0.0.1:8080'],
+    'interval': 2.0,
+    'window': 1800,
+    'gpus': [],                      # visible GPU identifiers; [] = all
+    'price': {
+        'enabled': True,
+        'zone': 'fi',
+        'timezone': 'Europe/Helsinki',
+        'sources': ['spotwatts', 'volton'],
+        'include_vat': False,
+        'fallback_vat_percent': 25.5,
+        'revalidate_hours': 6,
+        'fetch_interval': 60,        # coverage/refetch check cadence, seconds
+        'chart_back_hours': 6,       # chart window: past .. ahead
+        'chart_fwd_hours': 24,
+    },
+    'throttle': {
+        'enabled': False,
+        'threshold_c_per_kwh': 10.0,
+        'interval': 60,
+        'devices': [                 # identifier = same forms as gpus[]
+            # {"gpu": "GPU-...", "restore_watts": 250,
+            #  "low_watts": null, "fallback_low_watts": null}
+        ],
+    },
+}
+
+
+def _deep_merge(base, over):
+    out = dict(base)
+    for k, v in (over or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_config(argv_path=None):
+    """defaults < config file < MON_* env overrides."""
+    cfg = json.loads(json.dumps(DEFAULTS))  # deep copy
+    path = argv_path or os.environ.get('MON_CONFIG') or '/etc/llama-mon/config.json'
+    used = None
+    if path and os.path.exists(path):
+        try:
+            with open(path, encoding='utf-8') as f:
+                cfg = _deep_merge(cfg, json.load(f))
+            used = path
+        except Exception as e:
+            print('monitor: bad config %s: %r - using defaults/env' % (path, e),
+                  flush=True)
+    cfg['_config_file'] = used
+
+    def env(name, cast):
+        v = os.environ.get(name)
+        if v is None or v == '':
+            return None
+        try:
+            return cast(v)
+        except ValueError:
+            return None
+    if env('MON_HOST', str) is not None:
+        cfg['host'] = env('MON_HOST', str)
+    if env('MON_PORT', int) is not None:
+        cfg['port'] = env('MON_PORT', int)
+    urls = env('MON_URLS', str)
+    if urls:
+        cfg['urls'] = [u for u in re.split(r'[,\s]+', urls) if u]
+    for name, key, cast in (('MON_INTERVAL', 'interval', float),
+                            ('MON_WINDOW', 'window', int)):
+        if env(name, cast) is not None:
+            cfg[key] = env(name, cast)
+    gpus = env('MON_GPUS', str)
+    if gpus:
+        cfg['gpus'] = [u for u in re.split(r'[,\s]+', gpus) if u]
+    cfg['interval'] = max(0.5, float(cfg['interval']))
+    return cfg
+
+
+# ------------------------------------------------------------- spot prices
+# Free mirrors of the Nord Pool / SDAC day-ahead clearing results (both are
+# verified live here):
+#   spotwatts  https://spotwatts.com/api/v1/{zone}/{YYYY-MM-DD}.json
+#              "Prices: Spotwatts (https://spotwatts.com/)" - attribution
+#              required only if the numbers ever get republished publicly.
+#   volton     https://public-data.volton.energy/v1/day-ahead-spot-fi/
+#              Volton Technology OU, CC-BY-4.0. FI zone only.
+
+PRICE_UA = {'User-Agent': 'llama-mon/1.0 (personal spot-price GPU throttle)'}
+
+
+def _price_get_json(url, timeout=20):
+    req = urllib.request.Request(url, headers=PRICE_UA)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return json.loads(r.read().decode('utf-8')), None
+    except Exception as e:  # HTTPError 404 = tomorrow not published yet
+        return None, str(e)
+
+
+def _parse_iso(s):
+    return dt.datetime.fromisoformat(s)
+
+
+def _norm_intervals(rows, fallback_vat_pct):
+    """rows: [{start,end,price,price_vat}] in c/kWh -> epoch-keyed table."""
+    out = {}
+    for row in rows:
+        s, e = _parse_iso(row['start']), _parse_iso(row['end'])
+        ex, vat = row.get('price'), row.get('price_vat')
+        if ex is None and vat is None:
+            continue
+        if vat is None and ex is not None:
+            vat = ex * (1 + fallback_vat_pct / 100.0)
+        out[int(s.timestamp())] = {'end': int(e.timestamp()), 'ex_vat': ex, 'vat': vat}
+    return out
+
+
+def fetch_spotwatts_day(zone, date_str):
+    data, err = _price_get_json(
+        'https://spotwatts.com/api/v1/%s/%s.json' % (zone.lower(), date_str))
+    if data is None:
+        return None, 'spotwatts: %s' % err
+    rows = [{'start': i['start'], 'end': i['end'],
+             'price': round(i['price'] * 100.0, 5),       # EUR/kWh -> c/kWh
+             'price_vat': None if i.get('price_vat') is None
+             else round(i['price_vat'] * 100.0, 5)}
+            for i in data.get('intervals', [])]
+    return (rows, None) if rows else (None, 'spotwatts: empty day')
+
+
+def fetch_volton_day(zone, date_str, tz):
+    if zone.lower() != 'fi':
+        return None, 'volton: only the FI zone is exposed'
+    data, err = _price_get_json(
+        'https://public-data.volton.energy/v1/day-ahead-spot-fi/latest.json')
+    if data is None:
+        return None, 'volton: %s' % err
+    by = {}
+    for r in data.get('rows', []):
+        if r.get('price_eur_mwh') is None or not r.get('mtu_start'):
+            continue
+        by[int(_parse_iso(r['mtu_start'].replace('Z', '+00:00')).timestamp())] = \
+            r['price_eur_mwh']
+    starts = sorted(by)
+    rows = []
+    for i, s_ts in enumerate(starts):
+        # MTU length = gap to the next row (hourly before Oct 2025, 15 min since)
+        ln = starts[i + 1] - s_ts if i + 1 < len(starts) else 900
+        s = dt.datetime.fromtimestamp(s_ts, dt.timezone.utc)
+        e = dt.datetime.fromtimestamp(s_ts + min(ln, 3600), dt.timezone.utc)
+        rows.append({'start': s.isoformat(), 'end': e.isoformat(),
+                     # 1 EUR/MWh = 0.1 c/kWh (1 MWh = 1000 kWh)
+                     'price': by[s_ts] / 10.0, 'price_vat': None})
+    day = [r for r in rows
+           if _parse_iso(r['start']).astimezone(tz).strftime('%Y-%m-%d') == date_str]
+    return (day, None) if day else (None, 'volton: no rows for %s yet' % date_str)
+
+
+class PriceBank:
+    """In-memory day-ahead price table covering now .. now+24h, refetched on a
+    timer thread. Days already cached are re-fetched at most every
+    revalidate_hours (auction results do get revised); tomorrow's 96 quarters
+    are picked up once published (~14:00 EET)."""
+
+    def __init__(self, pcfg):
+        self.cfg = pcfg
+        self.tz = ZoneInfo(pcfg.get('timezone', 'Europe/Helsinki'))
+        self.enabled = bool(pcfg.get('enabled', True))
+        self.lock = threading.Lock()
+        self.table = {}          # epoch_start -> {end, ex_vat, vat}
+        self.fetched = {}        # YYYY-MM-DD -> ts of last successful fetch
+        self.last_err = None
+        self.next_check = 0.0
+
+    def _fetch_day(self, source, date_str):
+        zone = self.cfg.get('zone', 'fi')
+        if source == 'spotwatts':
+            return fetch_spotwatts_day(zone, date_str)
+        if source == 'volton':
+            return fetch_volton_day(zone, date_str, self.tz)
+        return None, 'unknown price source %r' % source
+
+    def _covering(self, start_ts):
+        hit = self.table.get(start_ts)
+        if hit is not None:
+            return hit
+        for s, e in self.table.items():
+            if s <= start_ts < e['end']:
+                return e
+        return None
+
+    def ensure(self, now):
+        """Fetch any local day needed to cover now .. now+24h. Called by the
+        refresher thread; returns nothing, state readable under self.lock."""
+        reval = float(self.cfg.get('revalidate_hours', 6)) * 3600
+        end_ts = now + 24 * 3600
+
+        def local_day(ts):
+            return (dt.datetime.fromtimestamp(ts, dt.timezone.utc)
+                    .astimezone(self.tz).strftime('%Y-%m-%d'))
+        with self.lock:
+            days, cur = set(), int(now)
+            while cur < end_ts:
+                hit = self._covering(cur)
+                if hit is None:
+                    days.add(local_day(cur))
+                    cur += 900
+                else:
+                    cur = hit['end']
+            # today/tomorrow stay worth a periodic refresh while they intersect
+            # the window: prices get revised, tomorrow only appears after ~14
+            for probe in (now, end_ts):
+                d = local_day(probe)
+                age = now - self.fetched.get(d, 0)
+                if d not in days and (d not in self.fetched or age > reval):
+                    days.add(d)
+            days = sorted(days)
+            errs = []
+            for date_str in days:
+                for source in self.cfg.get('sources', ['spotwatts', 'volton']):
+                    rows, err = self._fetch_day(source, date_str)
+                    if rows:
+                        self.table.update(_norm_intervals(
+                            rows, self.cfg.get('fallback_vat_percent', 25.5)))
+                        self.fetched[date_str] = now
+                        break
+                    errs.append(err)
+            keep_from = local_day(now - 86400)
+            self.fetched = {k: v for k, v in self.fetched.items() if k >= keep_from}
+            self.last_err = '; '.join(errs) if errs else None
+
+    def current(self, now_ts):
+        with self.lock:
+            e = self._covering(int(now_ts))
+            if e is None:
+                return None
+            key = 'vat' if self.cfg.get('include_vat') else 'ex_vat'
+            p = e.get(key)
+            return p if p is not None else e.get('ex_vat')
+
+    def curve(self, now_ts):
+        """[{start,end,price}] over [now-back, now+fwd] for the chart."""
+        back = float(self.cfg.get('chart_back_hours', 6)) * 3600
+        fwd = float(self.cfg.get('chart_fwd_hours', 24)) * 3600
+        lo, hi = now_ts - back, now_ts + fwd
+        with self.lock:
+            pts = [{'start': s, 'end': e['end'],
+                    'price': e.get('vat') if self.cfg.get('include_vat')
+                    else e.get('ex_vat')}
+                   for s, e in self.table.items()
+                   if e['end'] > lo and s < hi]
+        pts.sort(key=lambda p: p['start'])
+        return pts
+
+
+# ------------------------------------------------------------------ AMD GPUs
+# Stats come from sysfs (works without ROCm installed): gpu_busy_percent,
+# mem_info_vram_*, hwmon temp/power files, PCI link attributes. amd-smi (ROCm
+# >= 6.1, "SMI tool") is used only to augment names/UUIDs when it is present;
+# its JSON layout has changed across releases, so lookups accept several key
+# spellings. No AMD card exists in this box -> the path is written blind;
+# verify on an AMD machine before trusting it.
+
+AMD_VENDOR_ID = '0x1002'
+GEN_BY_RATE = ((32.0, 5), (16.0, 4), (8.0, 3), (5.0, 2), (2.5, 1))
+
+
+def _pci_gen(bdf):
+    v = _read('/sys/bus/pci/devices/%s/current_link_speed' % bdf)
+    m = re.match(r'(\d+(?:\.\d+)?)', v or '')
+    if not m:
+        return None
+    rate = float(m.group(1))
+    for lo, gen in GEN_BY_RATE:
+        if rate >= lo - 0.01:
+            return gen
+    return 1
+
+
+def _amd_hwmon(dev_dir):
+    try:
+        hm = os.path.join(dev_dir, 'hwmon')
+        for d in sorted(os.listdir(hm)):
+            yield os.path.join(hm, d)
+    except OSError:
+        pass
+
+
+def _amd_read_first(dev_dir, names, scale=1.0):
+    """First numeric value found among hwmon files called `names` (µW/mW/mC
+    scaled to W/W/C by `scale`)."""
+    for sub in _amd_hwmon(dev_dir):
+        for n in names:
+            p = os.path.join(sub, n)
+            if os.path.exists(p):
+                v = _read(p)
+                try:
+                    return float(v) * scale
+                except (TypeError, ValueError):
+                    pass
+    return None
+
+
+def _amd_smi_info():
+    """bdf -> {name, uuid} from amd-smi static JSON, {} when unavailable."""
+    rc, out = _sh(['amd-smi', 'static', '--json'])
+    if rc != 0:
+        return {}
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return {}
+
+    def pick(d, *keys):
+        for k in keys:
+            if isinstance(d, dict) and d.get(k) not in (None, ''):
+                return d[k]
+        return None
+    items = data if isinstance(data, list) else \
+        data.get('static_info') or data.get('data') or data.get('devices') or []
+    out_map = {}
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict):
+            continue
+        bdf = pick(it, 'bus_location', 'pci_address', 'bdf', 'pci_bus_id')
+        dev = it.get('device_info') if isinstance(it.get('device_info'), dict) else it
+        name = pick(dev, 'market_name', 'marketing_name', 'sku', 'market_name_brand') or \
+            pick(it, 'market_name', 'sku')
+        uuid = pick(it, 'uuid') or pick(dev, 'uuid')
+        if bdf:
+            bdf = str(bdf).lower()
+            if len(bdf) == 12 and bdf[4] == ':' and bdf[:2] != '00':
+                bdf = '0000:' + bdf
+            out_map[bdf] = {'name': name, 'uuid': uuid}
+    return out_map
+
+
+def query_amd():
+    """All AMD cards as monitor card dicts (same keys as the NVIDIA path),
+    [] when no AMD GPU exists."""
+    cards = []
+    try:
+        entries = sorted(os.listdir('/sys/class/drm'))
+    except OSError:
+        return cards
+    smi = _amd_smi_info()
+    for ent in entries:
+        m = re.fullmatch(r'card(\d+)', ent)
+        if not m:
+            continue
+        dev_dir = '/sys/class/drm/%s/device' % ent
+        if _read(os.path.join(dev_dir, 'vendor')) != AMD_VENDOR_ID:
+            continue
+        bdf = os.path.basename(os.path.realpath(dev_dir)).lower()
+        extra = smi.get(bdf, {})
+        dev_id = (_read(os.path.join(dev_dir, 'device')) or '?').lstrip('0x')
+        name = extra.get('name') or ('AMD GPU (%s)' % dev_id)
+        busy = _read(os.path.join(dev_dir, 'gpu_busy_percent'))
+        vt = _read(os.path.join(dev_dir, 'mem_info_vram_total'))
+        vu = _read(os.path.join(dev_dir, 'mem_info_vram_used'))
+
+        def mb(x):
+            try:
+                return float(x) / 1048576.0
+            except (TypeError, ValueError):
+                return None
+        width = _read('/sys/bus/pci/devices/%s/current_link_width' % bdf)
+        cards.append({
+            'vendor': 'amd', 'uuid': extra.get('uuid') or ('amd:' + bdf),
+            'name': name, 'bdf': bdf, 'index': None, 'card': 'card%s' % m.group(1),
+            'dev_dir': dev_dir,
+            'temp': _amd_read_first(dev_dir, ('temp1_input', 'edge_temp'), 0.001),
+            'util': _num(busy or ''),
+            'mem_util': None,
+            'mem_total': mb(vt), 'mem_used': mb(vu),
+            'power': _amd_read_first(dev_dir, ('power1_average', 'power1_input'), 1e-6),
+            'power_limit': _amd_read_first(dev_dir, ('power1_cap',), 1e-6),
+            'cap_min': _amd_read_first(dev_dir, ('power1_cap_min',), 1e-6),
+            'cap_max': _amd_read_first(dev_dir, ('power1_cap_max',), 1e-6),
+            'cap_default': None,
+            'gen': _pci_gen(bdf), 'width': _num(width or ''),
+        })
+    return cards
+
+
+def set_power_cap(card, watts):
+    """Write a power cap to a monitor card dict; raises RuntimeError on failure."""
+    w = ('%.2f' % float(watts)).rstrip('0').rstrip('.')
+    if card.get('vendor') == 'amd':
+        cap = None
+        for sub in _amd_hwmon(card['dev_dir']):
+            if os.path.exists(os.path.join(sub, 'power1_cap')):
+                cap = os.path.join(sub, 'power1_cap')
+                break
+        if cap:
+            try:
+                with open(cap, 'w') as f:
+                    f.write(str(int(float(watts) * 1e6)))   # hwmon = microwatts
+                return
+            except OSError:
+                rc, out = _sh_priv(['tee', cap], input=str(int(float(watts) * 1e6)))
+                if rc == 0:
+                    return
+                raise RuntimeError('writing %s failed: %s' % (cap, out.strip()[:200]))
+        pp = os.path.join(card['dev_dir'], 'pp_power_limit')
+        if os.path.exists(pp):
+            try:
+                with open(pp, 'w') as f:
+                    f.write(w)
+                return
+            except OSError:
+                rc, out = _sh_priv(['tee', pp], input=w)
+                if rc == 0:
+                    return
+        rc, out = _sh_priv(['amd-smi', 'set', '--device', card['bdf'],
+                            '--power-limit', w])
+        if rc == 0:
+            return
+        raise RuntimeError('amd cap setting failed (sysfs + amd-smi): %s'
+                           % out.strip()[:200])
+    rc, out = _sh_priv(['nvidia-smi', '-i', card['uuid'], '-pl', w])
+    if rc != 0:
+        raise RuntimeError('nvidia-smi -pl failed: %s' % out.strip()[:200])
+
+
 NV_FIELDS = ('index,uuid,name,pci.bus_id,temperature.gpu,utilization.gpu,'
              'utilization.memory,memory.total,memory.used,power.draw,power.limit,'
-             'pcie.link.gen.current,pcie.link.width.current')
+             'pcie.link.gen.current,pcie.link.width.current,'
+             'power.default_limit,power.min_limit,power.max_limit')
 
 
 def _num(x):
@@ -256,6 +716,39 @@ def _num(x):
     except ValueError:
         return None
     return int(f) if f.is_integer() else f
+
+
+def _sh(cmd, timeout=10, input=None):
+    """Run argv list -> (rc, stdout+stderr text)."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True,
+                           input=input, timeout=timeout)
+        return p.returncode, (p.stdout or '') + (p.stderr or '')
+    except Exception as e:
+        return 127, str(e)
+
+
+def _perm_err(text):
+    t = (text or '').lower()
+    return ('permission' in t or 'insufficient' in t
+            or ('access' in t and 'denied' in t))
+
+
+def _sh_priv(cmd, input=None):
+    """Run a command that needs privilege to change power caps: direct first,
+    then sudo -n (for non-root services; see the installer's sudoers drop-in)."""
+    rc, out = _sh(cmd, input=input)
+    if rc != 0 and _perm_err(out):
+        rc, out = _sh(['sudo', '-n'] + cmd, input=input)
+    return rc, out
+
+
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
 
 
 def _parent_bdf(bdf):
@@ -284,98 +777,293 @@ def read_aer(bdf):
 AER_DETAIL = ('BadTLP', 'BadDLLP', 'Timeout', 'Rollover')
 
 
+def _card_ids(card):
+    """Lowercased identifiers a config entry may match against."""
+    ids = {str(card.get('uuid') or '').lower()}
+    if card.get('bdf'):
+        ids.add(card['bdf'].lower())
+        ids.add('amd:' + card['bdf'].lower())
+    if card.get('card'):
+        ids.add(card['card'])
+        ids.add('amd:' + card['card'])
+    if card.get('index') is not None:
+        ids.add(str(card['index']))
+        ids.add('nvidia:%s' % card['index'])
+    ids.discard('')
+    return ids
+
+
+def card_matches(card, wanted):
+    """wanted = [] (all) or list of identifier strings; NVIDIA UUID entries
+    also accept a unique substring of the UUID for handy typing."""
+    if not wanted:
+        return True
+    ids = _card_ids(card)
+    uuid = str(card.get('uuid') or '').lower()
+    for tok in wanted:
+        t = tok.lower()
+        if t in ids or (uuid and t in uuid):
+            return True
+    return False
+
+
 class GpuBank:
-    def __init__(self, uuid_filter):
-        self.filter = set(uuid_filter)
+    def __init__(self, gpu_filter):
+        self.filter = [str(x) for x in gpu_filter]
         self.cards = []        # metadata + last live values (for the API)
         self.aer_detail = {}   # bdf -> {'dev': {...}, 'port': {...}}
         self.prev_aer = {}     # bdf -> (cumulative, wall)
+        self.lock = threading.Lock()
 
-    def _query(self):
+    def _query_nvidia(self):
         try:
             out = subprocess.run(
                 ['nvidia-smi', '--query-gpu', NV_FIELDS, '--format=csv,noheader,nounits'],
                 capture_output=True, text=True, timeout=10)
         except Exception:
-            return None
+            return []
         if out.returncode != 0:
-            return None
+            return []
         cards = []
         for line in out.stdout.splitlines():
             f = [x.strip() for x in line.split(',')]
-            if len(f) < 13:
+            if len(f) < 16:
                 continue
             bdf = f[3]
             if len(bdf) > 12:
                 bdf = bdf[4:]  # 00000000:81:00.0 -> 0000:81:00.0
-            if self.filter and f[1] not in self.filter:
-                continue
             cards.append({
+                'vendor': 'nvidia',
                 'uuid': f[1], 'name': f[2], 'bdf': bdf, 'index': _num(f[0]),
                 'temp': _num(f[4]), 'util': _num(f[5]), 'mem_util': _num(f[6]),
                 'mem_total': _num(f[7]), 'mem_used': _num(f[8]),
                 'power': _num(f[9]), 'power_limit': _num(f[10]),
                 'gen': _num(f[11]), 'width': _num(f[12]),
+                'cap_default': _num(f[13]), 'cap_min': _num(f[14]),
+                'cap_max': _num(f[15]),
             })
         return cards
+
+    def _query(self):
+        cards = self._query_nvidia() + query_amd()
+        if not cards and not self.filter:
+            return None      # nothing probed at all: keep the previous state
+        return [c for c in cards if card_matches(c, self.filter)]
+
+    def snapshot(self):
+        with self.lock:
+            return [dict(c) for c in self.cards]
 
     def sample(self, now):
         cards = self._query()
         if cards is None:
             return {}
-        if not self.cards or [c['bdf'] for c in cards] != [c['bdf'] for c in self.cards]:
-            for c in cards:
-                c['port'] = _parent_bdf(c['bdf'])
-            self.cards = cards
-        else:
-            # topology unchanged: refresh the live fields (temp/util/mem/power)
-            # in the cached cards; the fresh query result carries no 'port'.
-            for old, new in zip(self.cards, cards):
-                old.update(new)
-        s = {}
-        for i, c in enumerate(self.cards):
-            dev = read_aer(c['bdf'])
-            port = read_aer(c['port']) if c['port'] else None
-            self.aer_detail[c['bdf']] = {'dev': dev, 'port': port}
-            cum, have = 0, False
-            for d in (dev, port):
-                if d and d.get('TOTAL_ERR_COR') is not None:
-                    cum += d['TOTAL_ERR_COR']
-                    have = True
-            if have:
-                s['g%d.aer_cum' % i] = cum
-                prev = self.prev_aer.get(c['bdf'])
-                if prev and now > prev[1]:
-                    s['g%d.aer_rate' % i] = max(0.0, (cum - prev[0]) / (now - prev[1]) * 60.0)
-                else:
-                    s['g%d.aer_rate' % i] = 0.0
-                self.prev_aer[c['bdf']] = (cum, now)
-            s['g%d.temp' % i] = c['temp']
-            s['g%d.util' % i] = c['util']
-            s['g%d.mem_used' % i] = (c['mem_used'] / 1024.0) if c['mem_used'] is not None else None
-            s['g%d.mem_pct' % i] = (100.0 * c['mem_used'] / c['mem_total']
-                                    if c['mem_total'] and c['mem_used'] is not None else None)
-            s['g%d.power' % i] = c['power']
-        return s
+        with self.lock:
+            if not self.cards or [c['bdf'] for c in cards] != [c['bdf'] for c in self.cards]:
+                for c in cards:
+                    c['port'] = _parent_bdf(c['bdf'])
+                self.cards = cards
+            else:
+                # topology unchanged: refresh the live fields (temp/util/mem/power)
+                # in the cached cards; the fresh query result carries no 'port'.
+                for old, new in zip(self.cards, cards):
+                    old.update(new)
+            s = {}
+            for i, c in enumerate(self.cards):
+                dev = read_aer(c['bdf'])
+                port = read_aer(c['port']) if c['port'] else None
+                self.aer_detail[c['bdf']] = {'dev': dev, 'port': port}
+                cum, have = 0, False
+                for d in (dev, port):
+                    if d and d.get('TOTAL_ERR_COR') is not None:
+                        cum += d['TOTAL_ERR_COR']
+                        have = True
+                if have:
+                    s['g%d.aer_cum' % i] = cum
+                    prev = self.prev_aer.get(c['bdf'])
+                    if prev and now > prev[1]:
+                        s['g%d.aer_rate' % i] = max(0.0, (cum - prev[0]) / (now - prev[1]) * 60.0)
+                    else:
+                        s['g%d.aer_rate' % i] = 0.0
+                    self.prev_aer[c['bdf']] = (cum, now)
+                s['g%d.temp' % i] = c['temp']
+                s['g%d.util' % i] = c['util']
+                s['g%d.mem_used' % i] = (c['mem_used'] / 1024.0) if c['mem_used'] is not None else None
+                s['g%d.mem_pct' % i] = (100.0 * c['mem_used'] / c['mem_total']
+                                        if c['mem_total'] and c['mem_used'] is not None else None)
+                s['g%d.power' % i] = c['power']
+                s['g%d.plimit' % i] = c['power_limit']
+            return s
 
     def meta(self):
         out = []
-        for i, c in enumerate(self.cards):
-            det = self.aer_detail.get(c['bdf'], {})
+        with self.lock:
+            cards = list(self.cards)
+            detail = dict(self.aer_detail)
+        for i, c in enumerate(cards):
+            det = detail.get(c['bdf'], {})
             dev, port = det.get('dev'), det.get('port')
 
             def brief(d):
                 return {k: d.get(k, 0) for k in AER_DETAIL} if d else None
 
             out.append({'id': i, 'name': c['name'], 'uuid': c['uuid'],
-                        'index': c['index'], 'bdf': c['bdf'],
+                        'vendor': c.get('vendor', 'nvidia'),
+                        'index': c['index'], 'card': c.get('card'),
+                        'bdf': c['bdf'],
                         'link': 'Gen%s x%s' % (c['gen'], c['width']),
                         'power_limit': c['power_limit'],
+                        'cap_min': c.get('cap_min'), 'cap_max': c.get('cap_max'),
+                        'cap_default': c.get('cap_default'),
                         'mem_total': c['mem_total'],
                         'aer_dev_total': dev.get('TOTAL_ERR_COR') if dev else None,
                         'aer_port_total': port.get('TOTAL_ERR_COR') if port else None,
                         'aer_dev': brief(dev), 'aer_port': brief(port)})
         return out
+
+
+# ------------------------------------------------------- spot-price throttle
+
+def _amd_cap_now(card):
+    """Current AMD power cap in W read straight from sysfs (fresh, cheap)."""
+    return _amd_read_first(card['dev_dir'], ('power1_cap',), 1e-6)
+
+
+class Throttle:
+    """Reconciles GPU power caps against the current FI spot price, the way
+    gpu-power.py did from cron, but inside the monitor process: above the
+    threshold -> minimum power limit, at/below -> restore_watts. Writes only
+    when current != target, so it also repairs caps changed elsewhere."""
+
+    def __init__(self, tcfg, price, gpus):
+        self.cfg = tcfg
+        self.price = price
+        self.gpus = gpus
+        self.enabled = bool(tcfg.get('enabled')) and price.enabled
+        self.threshold = float(tcfg.get('threshold_c_per_kwh', 10.0))
+        self.interval = max(10.0, float(tcfg.get('interval', 60)))
+        self.lock = threading.Lock()
+        self.high = None
+        self.price_now = None
+        self.last_check = None
+        self.no_price_logged = False
+        self.events = deque(maxlen=50)
+        self.devices = [{'spec': dict(d), 'gpu': str(d.get('gpu')),
+                         'name': None, 'state': '-', 'want': None,
+                         'have': None, 'status': 'pending', 'error': None}
+                        for d in (tcfg.get('devices') or [])]
+
+    def _event(self, msg):
+        line = '%s %s' % (time.strftime('%Y-%m-%d %H:%M:%S'), msg)
+        print(line, flush=True)
+        with self.lock:
+            self.events.append(line)
+
+    @staticmethod
+    def _find_card(gpus, ident):
+        for c in gpus.snapshot():
+            if card_matches(c, [str(ident)]):
+                return c
+        return None
+
+    def _target_watts(self, card, spec, high):
+        """Watts we want this GPU to have right now; raises ValueError with a
+        human reason when the target cannot be computed."""
+        if high:
+            if spec.get('low_watts') is not None:
+                return float(spec['low_watts'])
+            lo = card.get('cap_min')
+            if lo is None:
+                lo = spec.get('fallback_low_watts')
+            if lo is None:
+                raise ValueError('driver minimum power limit unknown - set '
+                                 'low_watts or fallback_low_watts')
+            return float(lo)
+        w = spec.get('restore_watts', 'default')
+        if w == 'default':
+            # AMD sysfs has no "factory default": its default cap equals the
+            # max unless someone overrode it, so cap_max is the best guess.
+            w = card.get('cap_default')
+            if w is None:
+                w = card.get('cap_max')
+            if w is None:
+                raise ValueError('default power limit unknown - set '
+                                 'restore_watts explicitly')
+        return float(w)
+
+    def _have_watts(self, card):
+        if card.get('vendor') == 'amd':
+            return _amd_cap_now(card)
+        return card.get('power_limit')
+
+    def check(self, now):
+        price = self.price.current(now)
+        with self.lock:
+            self.price_now = price
+            self.last_check = now
+        if price is None:
+            if not self.no_price_logged:
+                self._event('throttle: no spot price for the current interval '
+                            '(auction not published yet?) - caps left untouched')
+                self.no_price_logged = True
+            return
+        self.no_price_logged = False
+        high = price > self.threshold
+        if high != self.high:
+            self._event('spot %.2f c/kWh %s threshold %.2f -> %s' % (
+                price, 'above' if high else 'at/below', self.threshold,
+                'THROTTLE to minimum caps' if high else 'restore caps'))
+            self.high = high
+        if not self.gpus.snapshot():
+            return  # GPU list not sampled yet (first cycles after start): defer
+        cards_checked = []
+        for dev in self.devices:
+            spec = dev['spec']
+            ident = spec.get('gpu')
+            label = str(ident)
+            card = None
+            try:
+                card = self._find_card(self.gpus, ident)
+                if card is None:
+                    raise ValueError('GPU %r not found (not present or hidden '
+                                     'by the gpus visibility filter)' % ident)
+                label = '%s (%s)' % (card.get('name'), card.get('uuid'))
+                want = self._target_watts(card, spec, high)
+                have = self._have_watts(card)
+                if have is not None and abs(have - want) < 0.5:
+                    status, err = 'ok', None
+                else:
+                    set_power_cap(card, want)
+                    status = 'set %.1fW' % want
+                    err = None
+                    self._event('%s cap %s -> %.1fW (%s)' % (
+                        label, '%.1fW' % have if have is not None else '?',
+                        want, 'high price' if high else 'normal price'))
+            except Exception as e:
+                want, have, status, err = None, None, 'error', str(e)
+                if dev['error'] != err:      # log each new failure once, not spam
+                    self._event('throttle ERROR %s: %s' % (label, err))
+            cards_checked.append({
+                'label': label, 'gpu': str(ident), 'name': card.get('name') if card else None,
+                'uuid': card.get('uuid') if card else None,
+                'state': 'high' if high else 'low',
+                'want': want, 'have': have, 'status': status, 'error': err})
+            with self.lock:
+                dev.update(state='high' if high else 'low', want=want,
+                           have=have, status=status, error=err, name=label)
+        return cards_checked
+
+    def status(self):
+        with self.lock:
+            devs = [{k: v for k, v in d.items() if k != 'spec'} for d in self.devices]
+            events = list(self.events)[-12:]
+            return {'enabled': self.enabled,
+                    'threshold': self.threshold,
+                    'include_vat': bool(self.price.cfg.get('include_vat')),
+                    'interval': self.interval,
+                    'price': self.price_now, 'high': self.high,
+                    'last_check': self.last_check,
+                    'devices': devs, 'events': events}
 
 
 class HostBank:
@@ -447,13 +1135,16 @@ class HostBank:
 # ---------------------------------------------------------------- state
 
 class State:
-    def __init__(self, urls, interval, window, gpu_filter):
-        self.backends = [Backend(u, interval) for u in urls]
-        self.gpus = GpuBank(gpu_filter)
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.backends = [Backend(u, cfg['interval']) for u in cfg['urls']]
+        self.gpus = GpuBank(cfg.get('gpus') or [])
         self.host = HostBank()
-        self.interval = interval
+        self.price = PriceBank(cfg['price'])
+        self.throttle = Throttle(cfg['throttle'], self.price, self.gpus)
+        self.interval = cfg['interval']
         self.started = time.time()
-        self.hist = deque(maxlen=max(10, int(window / interval)))
+        self.hist = deque(maxlen=max(10, int(cfg['window'] / self.interval)))
         self.lock = threading.Lock()
 
     def collect(self):
@@ -495,7 +1186,7 @@ class State:
         for k in keys:
             series[k] = [round(v, 2) if isinstance(v, float) else v
                          for v in (smp.get(k) for smp in tail)]
-        return {
+        out = {
             'now': time.time(),
             'interval': self.interval,
             'points': n,
@@ -511,6 +1202,19 @@ class State:
                      if self.host.swap_total_kb else None},
             'series': series,
         }
+        if self.price.enabled:
+            now = time.time()
+            out['price'] = {
+                'zone': self.price.cfg.get('zone', 'fi').upper(),
+                'current': self.price.current(now),
+                'include_vat': bool(self.price.cfg.get('include_vat')),
+                'threshold': self.throttle.threshold if self.throttle.enabled else None,
+                'throttled': self.throttle.high if self.throttle.enabled else None,
+                'curve': self.price.curve(now),
+                'err': self.price.last_err,
+            }
+        out['throttle'] = self.throttle.status() if self.throttle.enabled else None
+        return out
 
 
 # ---------------------------------------------------------------- http
@@ -545,6 +1249,11 @@ margin-bottom:12px;padding:10px 14px;background:var(--card);border:1px solid var
 .sl .row{display:flex;justify-content:space-between;font-size:11.5px;color:var(--dim);margin-bottom:1px}
 .sl .val{font:600 12px ui-monospace,Menlo,Consolas,monospace;color:var(--tx)}
 canvas{width:100%;height:46px;display:block}
+.price canvas{height:78px}
+.ev{margin-top:8px;color:var(--dim);font:11px/1.5 ui-monospace,Menlo,Consolas,monospace;
+word-break:break-word}
+.badge.hot{background:#ffebe9;color:var(--red);border:1px solid #ffcecb}
+.badge.warn{background:#fff8c5;color:var(--amb);border:1px solid #eed27a}
 .dual .val{color:var(--amb)}
 </style></head><body>
 <div class="top"><h1>llama.cpp monitor <span id="h-badge"></span></h1>
@@ -635,6 +1344,81 @@ function spark(cv, a, b, o){
   }
 }
 
+function drawPrice(cv, pts, o){
+  // Day-ahead price chart: step line over [back..fwd], dashed threshold,
+  // "now" marker; segments above the threshold drawn in red.
+  const w = cv.clientWidth || 300, h = cv.clientHeight || 78;
+  const dpr = window.devicePixelRatio || 1;
+  if (cv.width !== Math.round(w*dpr) || cv.height !== Math.round(h*dpr)){
+    cv.width = Math.round(w*dpr); cv.height = Math.round(h*dpr);
+  }
+  const x = cv.getContext("2d");
+  x.setTransform(dpr,0,0,dpr,0,0);
+  x.clearRect(0,0,w,h);
+  x.strokeStyle = "#d0d7de";
+  x.beginPath(); x.moveTo(0,h-.5); x.lineTo(w,h-.5); x.stroke();
+  if (!pts || !pts.length){
+    x.fillStyle = "#656d76"; x.font = "11px sans-serif"; x.textAlign = "center";
+    x.fillText("no price data yet", w/2, h/2+4);
+    return;
+  }
+  const t0 = pts[0].start, t1 = pts[pts.length-1].end;
+  const vals = pts.map(p => p.price).filter(v => v != null);
+  if (o.threshold != null) vals.push(o.threshold);
+  let mn = Math.min(...vals), mx = Math.max(...vals);
+  if (mx-mn < 1e-9) mx = mn+1;
+  const pad = (mx-mn)*.12; mn -= pad; mx += pad;
+  const X = t => (t-t0)/(t1-t0)*w;
+  const Y = v => h-2-(v-mn)/(mx-mn)*(h-4);
+  const seg = (from, to, color, width) => {   // [lo,hi) time window in one colour
+    x.beginPath(); let on = false, lastX = 0, lastY = h;
+    for (const p of pts){
+      if (p.end <= from || p.start >= to || p.price == null) continue;
+      const y = Y(p.price), xa = Math.max(X(p.start), X(from)), xb = Math.min(X(p.end), X(to));
+      if (!on){ x.moveTo(xa,y); on = true; } else if (Math.abs(lastY-y) > .5){ x.lineTo(xa,y); }
+      x.lineTo(xb,y); lastX = xb; lastY = y;
+    }
+    if (!on) return;
+    x.strokeStyle = color; x.lineWidth = width; x.stroke();
+  };
+  if (o.threshold != null){
+    // tint the above-threshold slices red, then draw the whole curve blue and
+    // re-draw just the hot slices on top in red.
+    for (const p of pts){
+      if (p.price != null && p.price > o.threshold){
+        const xa = X(p.start), xb = X(p.end), y = Y(p.price);
+        x.fillStyle = "#cf222e18";
+        x.fillRect(xa, y, xb-xa, h-2-y);
+      }
+    }
+  }
+  seg(t0-1, t1+1, "#0969da", 1.4);
+  if (o.threshold != null) seg(t0-1, t1+1, "#cf222e", 1.6);
+  if (o.threshold != null){
+    x.setLineDash([4,3]); x.strokeStyle = "#bf8700"; x.lineWidth = 1;
+    x.beginPath(); x.moveTo(0,Y(o.threshold)); x.lineTo(w,Y(o.threshold)); x.stroke();
+    x.setLineDash([]);
+  }
+  const nowX = X(o.now);
+  if (nowX >= 0 && nowX <= w){
+    x.setLineDash([2,2]); x.strokeStyle = "#656d76";
+    x.beginPath(); x.moveTo(nowX,0); x.lineTo(nowX,h); x.stroke(); x.setLineDash([]);
+    for (const p of pts){
+      if (p.price != null && o.now >= p.start && o.now < p.end){
+        x.fillStyle = (o.threshold != null && p.price > o.threshold) ? "#cf222e" : "#1a7f37";
+        x.beginPath(); x.arc(X(p.end === undefined ? p.start : Math.max(p.start, o.now)),
+                             Y(p.price), 3, 0, 7); x.fill();
+      }
+    }
+  }
+  const lab = v => v.toFixed(v >= 100 ? 0 : 1);
+  x.fillStyle = "#656d76"; x.font = "10px ui-monospace,Menlo,Consolas,monospace";
+  x.textAlign = "right";  x.fillText(lab(mx)+" c", w-2, 10);
+  x.textAlign = "left";   x.fillText(lab(mn)+" c", 2, h-3);
+  x.textAlign = "center";
+  x.fillText("now", Math.min(Math.max(nowX, 14), w-14), h-3);
+}
+
 function makeSpark(parent, label, key, unit, color, opts){
   opts = opts || {};
   const div = document.createElement("div");
@@ -706,22 +1490,53 @@ function build(d){
     const i = g.id;
     const c = document.createElement("div"); c.className = "card";
     const h2 = document.createElement("h2");
-    h2.innerHTML = '<span class="gn"></span> <span class="sub"></span> <span class="badge link"></span>';
+    h2.innerHTML = '<span class="gn"></span> <span class="sub"></span> ' +
+                   '<span class="badge link"></span><span class="tbad"></span>';
     h2.querySelector(".gn").textContent = g.name;
-    h2.querySelector(".sub").textContent = "idx "+g.index+" · "+g.bdf;
+    h2.querySelector(".sub").textContent =
+      (g.vendor === "amd" ? (g.card || "amd") : "idx " + g.index) + " · " + g.bdf;
     h2.querySelector(".badge.link").textContent = g.link || "?";
     c.append(h2);
     const st = document.createElement("div"); st.className = "stats"; c.append(st);
-    const rec = { st, sparks: [
+    const rec = { st, tbad: h2.querySelector(".tbad"), sparks: [
       makeSpark(c, "Temperature", "g"+i+".temp", "°C", "#cf222e", { d: 0, min: 0, max: 90 }),
       makeSpark(c, "GPU utilization", "g"+i+".util", "%", "#0969da", { d: 0, min: 0, max: 100 }),
       makeSpark(c, "VRAM", "g"+i+".mem_pct", "%", "#8250df", { d: 0, min: 0, max: 100 }),
       makeSpark(c, "Power", "g"+i+".power", "W", "#bf8700",
                 { min: 0, max: g.power_limit || null }),
+      makeSpark(c, "Power limit (cap)", "g"+i+".plimit", "W", "#656d76", { min: 0 }),
       makeSpark(c, "PCIe AER (rate /min + cumulative)", "g"+i+".aer_rate", "/min",
                 "#cf222e", { extra: "g"+i+".aer_cum" })]};
     gpus[i] = rec; grid.append(c);
   });
+  let priceRec = null;
+  if (d.price){
+    const c = document.createElement("div"); c.className = "card price";
+    const h2 = document.createElement("h2");
+    h2.innerHTML = '<span></span> <span class="sub"></span> <span class="pbad"></span>';
+    h2.firstChild.textContent = d.price.zone + " day-ahead spot price";
+    h2.querySelector(".sub").textContent =
+      d.price.include_vat ? "incl VAT" : "excl VAT";
+    c.append(h2);
+    const st = document.createElement("div"); st.className = "stats"; c.append(st);
+    const cv = document.createElement("canvas"); c.append(cv);
+    const ev = document.createElement("div"); ev.className = "ev"; c.append(ev);
+    priceRec = { st, cv, ev, badge: h2.querySelector(".pbad"), refresh: p => {
+      setStat(priceRec.st, "now", p.current == null ? "\u2013"
+              : p.current.toFixed(2)+" c/kWh");
+      setStat(priceRec.st, "threshold", p.threshold == null ? "\u2013"
+              : p.threshold.toFixed(2)+" c/kWh");
+      drawPrice(cv, p.curve, { threshold: p.threshold, now: p.now });
+      let b = "";
+      if (p.throttled === true) b = '<span class="badge hot">THROTTLED</span>';
+      else if (p.throttled === false) b = '<span class="badge up">OK</span>';
+      priceRec.badge.innerHTML = b;
+      const lines = (p.events || []).slice(-3);
+      ev.textContent = p.err && !lines.length ? p.err : lines.join("\n");
+      ev.style.whiteSpace = "pre-line";
+    }};
+    grid.append(c);
+  }
   {
     const c = document.createElement("div"); c.className = "card";
     const h2 = document.createElement("h2");
@@ -734,7 +1549,7 @@ function build(d){
       makeSpark(c, "Network (rx + tx)", "h.rx", "MB/s", "#0e7490", { extra: "h.tx" })]};
     grid.append(c);
   }
-  refs = { servers, gpus, host: host.rec };
+  refs = { servers, gpus, host: host.rec, price: priceRec };
 }
 
 function update(d){
@@ -773,6 +1588,16 @@ function update(d){
   d.gpus.forEach(g => {
     const r = refs.gpus[g.id]; if (!r) return;
     const i = g.id;
+    let tb = "";
+    if (d.throttle){
+      const dev = d.throttle.devices.find(x => x.uuid && g.uuid && x.uuid === g.uuid);
+      if (dev && dev.state === "high")
+        tb = dev.error ? '<span class="badge hot">cap error</span>'
+                       : '<span class="badge warn">capped</span>';
+      else if (dev && dev.error)
+        tb = '<span class="badge hot">throttle error</span>';
+    }
+    r.tbad.innerHTML = tb;
     setStat(r.st, "temp", statVal(ser, "g"+i+".temp", "°C", 0));
     setStat(r.st, "util", statVal(ser, "g"+i+".util", "%", 0));
     setStat(r.st, "vram", g.mem_total
@@ -801,6 +1626,10 @@ function update(d){
   const all = [...refs.servers, ...Object.values(refs.gpus)].filter(Boolean);
   all.push(refs.host);
   for (const r of all) for (const sp of r.sparks) sp.refresh(ser);
+  if (refs.price && d.price){
+    refs.price.refresh(Object.assign({}, d.price, {
+      now: d.now, events: d.throttle ? d.throttle.events : null }));
+  }
 }
 
 async function tick(){
@@ -851,15 +1680,47 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
-    host = os.environ.get('MON_HOST', '127.0.0.1')
-    port = int(os.environ.get('MON_PORT', '8085'))
-    urls = [u for u in re.split(r'[,\s]+', os.environ.get('MON_URLS', 'http://127.0.0.1:8080')) if u]
-    interval = max(0.5, float(os.environ.get('MON_INTERVAL', '2')))
-    window = int(os.environ.get('MON_WINDOW', '1800'))
-    gpu_filter = [u for u in re.split(r'[,\s]+', os.environ.get('MON_GPUS', '')) if u]
+    import argparse
+    ap = argparse.ArgumentParser(description='llama-mon dashboard')
+    ap.add_argument('--config', default=None,
+                    help='JSON config file (default: $MON_CONFIG, then '
+                         '/etc/llama-mon/config.json when present)')
+    args = ap.parse_args()
+    cfg = load_config(args.config)
+    host, port = cfg['host'], int(cfg['port'])
 
-    state = State(urls, interval, window, gpu_filter)
+    state = State(cfg)
     Handler.state = state
+
+    if state.price.enabled:
+        try:                       # first fetch synchronously so the dashboard
+            state.price.ensure(time.time())
+        except Exception as e:
+            print('price: initial fetch failed: %r' % e, flush=True)
+
+        def price_loop():
+            every = max(30.0, float(state.price.cfg.get('fetch_interval', 60)))
+            while True:
+                try:
+                    state.price.ensure(time.time())
+                except Exception as e:
+                    print('price: refresh error: %r' % e, flush=True)
+                time.sleep(every)
+        threading.Thread(target=price_loop, daemon=True).start()
+
+    if state.throttle.enabled:
+        def throttle_loop():
+            while True:
+                try:
+                    state.throttle.check(time.time())
+                except Exception as e:
+                    print('throttle: check error: %r' % e, flush=True)
+                time.sleep(state.throttle.interval)
+        if not state.throttle.devices:
+            print('throttle: enabled but no devices configured - nothing to do',
+                  flush=True)
+        else:
+            threading.Thread(target=throttle_loop, daemon=True).start()
 
     def loop():
         while True:
@@ -868,11 +1729,17 @@ def main():
                 state.collect()
             except Exception as e:
                 print('collect error: %r' % e, flush=True)
-            time.sleep(max(0.0, interval - (time.time() - t0)))
+            time.sleep(max(0.0, state.interval - (time.time() - t0)))
 
     threading.Thread(target=loop, daemon=True).start()
-    print('llama-mon: http://%s:%d/  servers=%s interval=%.1fs window=%ds gpus=%s'
-          % (host, port, ','.join(urls), interval, window, gpu_filter or 'all'), flush=True)
+    print('llama-mon: http://%s:%d/  servers=%s interval=%.1fs window=%ds gpus=%s '
+          'config=%s price=%s throttle=%s'
+          % (host, port, ','.join(cfg['urls']), state.interval, int(cfg['window']),
+             cfg['gpus'] or 'all', cfg.get('_config_file') or '(defaults+env)',
+             'on' if state.price.enabled else 'off',
+             ('on %.1fW-threshold-devs=%d' % (state.throttle.threshold,
+                                              len(state.throttle.devices))
+              if state.throttle.enabled else 'off')), flush=True)
     ThreadingHTTPServer((host, port), Handler).serve_forever()
 
 
