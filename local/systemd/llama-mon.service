@@ -1,0 +1,35 @@
+# /etc/systemd/system/llama-mon.service - llama.cpp + GPU + host monitor with
+# the Nord Pool spot-price GPU power throttle. Installed by
+# local/systemd/install.sh, which copies the code to an install prefix
+# (@PREFIX@ below, default /opt/llama-mon) and substitutes the real path.
+# The service never runs out of the git checkout: updating means re-running
+# the installer, so repo checkouts can come and go without breaking the unit.
+#
+#   systemctl {start|stop|restart|status} llama-mon
+#   journalctl -u llama-mon -f
+#   curl -fsS http://127.0.0.1:8085/healthz
+#
+# Setting GPU power caps needs root. The unit runs as root by default. To run
+# unprivileged instead, set User= below AND install the sudoers drop-in
+# (local/systemd/llama-mon.sudoers, see install.sh --with-sudoers=USER): the
+# monitor then escalates only for the cap writes themselves via "sudo -n".
+
+[Unit]
+Description=llama.cpp + GPU + host monitor (Nord Pool spot-price GPU throttle)
+Documentation=file://@PREFIX@/README.md
+Wants=network-online.target
+After=network-online.target nvidia-persistenced.service strata.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 @PREFIX@/monitor.py \
+          --config /etc/llama-mon/config.json
+Restart=on-failure
+RestartSec=5
+User=root
+# User=llama-mon
+# NoNewPrivileges and PrivateTmp are deliberately left off in the unprivileged
+# variant: the throttle needs "sudo -n" (setuid) for nvidia-smi -pl / tee.
+
+[Install]
+WantedBy=multi-user.target

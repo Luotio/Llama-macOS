@@ -1,0 +1,14 @@
+# /etc/sudoers.d/llama-mon - let the monitor's service user set GPU power caps
+# without a password, so llama-mon.service can run unprivileged while still
+# throttling on high spot prices. Install with install.sh --with-sudoers=USER
+# (it substitutes USER and validates via visudo -c), or by hand:
+#
+#   sudo visudo -f /etc/sudoers.d/llama-mon
+#
+# Paths must match what monitor.py invokes: nvidia-smi and tee resolve through
+# sudo's secure_path, so keep the absolute paths below in sync with `which`.
+
+MONUSER ALL=(root) NOPASSWD: /usr/bin/nvidia-smi -i GPU-* -pl *
+MONUSER ALL=(root) NOPASSWD: /usr/bin/tee /sys/class/drm/card*/device/hwmon/*/power1_cap /sys/class/drm/card*/device/pp_power_limit
+# AMD cards whose driver only speaks amd-smi (ROCm SMI tool), if ever needed:
+# MONUSER ALL=(root) NOPASSWD: /opt/rocm/bin/amd-smi set --device * --power-limit *

@@ -1,0 +1,39 @@
+{
+  "_comment": "llama-mon config. Live installs keep theirs at /etc/llama-mon/config.json (installed by local/systemd/install.sh or seeded by the OpenRC installer); this file is the repo-side template. Precedence: defaults < this file < MON_* env. Unknown keys are ignored, so _comment strings are safe.",
+
+  "host": "127.0.0.1",
+  "port": 8085,
+  "urls": ["http://127.0.0.1:8080"],
+  "interval": 2,
+  "window": 1800,
+
+  "_gpus_comment": "Visible GPU cards; [] = all. Identifiers: NVIDIA UUID (full or substring), nvidia index, amd:cardN, amd:BDF or BDF. This box: only the two V100s (the GTX 1080 stays hidden).",
+  "gpus": [
+    "GPU-e487578c-0be1-8c0b-ad8b-0ab0615c4850",
+    "GPU-40faaa73-acef-a2eb-1f38-7b96df067d5c"
+  ],
+
+  "price": {
+    "enabled": true,
+    "zone": "fi",
+    "timezone": "Europe/Helsinki",
+    "sources": ["spotwatts", "volton"],
+    "include_vat": false,
+    "fallback_vat_percent": 25.5,
+    "revalidate_hours": 6,
+    "fetch_interval": 60,
+    "chart_back_hours": 6,
+    "chart_fwd_hours": 24
+  },
+
+  "_throttle_comment": "Above threshold -> each device gets its minimum power limit; at/below -> restore_watts (number or \"default\" = driver factory default). low_watts omitted = driver minimum (150 W on these V100s). Writes need root: run the service as root or install local/systemd/llama-mon.sudoers.",
+  "throttle": {
+    "enabled": true,
+    "threshold_c_per_kwh": 10.0,
+    "interval": 60,
+    "devices": [
+      { "gpu": "GPU-e487578c-0be1-8c0b-ad8b-0ab0615c4850", "restore_watts": 250 },
+      { "gpu": "GPU-40faaa73-acef-a2eb-1f38-7b96df067d5c", "restore_watts": 250 }
+    ]
+  }
+}
