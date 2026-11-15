@@ -1,0 +1,36 @@
+{
+  "_comment": "llama-mon config for lucifer (systemd, Radeon RX 7900 XTX at PCI 0000:0b:00.0 + a Quadro P2000 at 0000:04:00.0). Install: copy to /etc/llama-mon/config.json BEFORE running local/systemd/install.sh, or run the installer first and let it seed then overwrite; either way the installer never clobbers an existing /etc config. Precedence: defaults < this file < MON_* env.",
+
+  "host": "127.0.0.1",
+  "port": 8085,
+  "urls": ["http://127.0.0.1:8080"],
+  "interval": 2,
+  "window": 1800,
+
+  "_gpus_comment": "Both cards visible: Radeon RX 7900 XTX at 0000:0b:00.0 and Quadro P2000 at 0000:04:00.0 (BDFs survive card-number reshuffles; 'amd:card1' / nvidia index would not be boot-stable). To hide the P2000 again, drop its entry from gpus.",
+  "gpus": ["amd:0000:0b:00.0", "0000:04:00.0"],
+
+  "price": {
+    "enabled": true,
+    "zone": "fi",
+    "timezone": "Europe/Helsinki",
+    "sources": ["spotwatts", "volton"],
+    "include_vat": false,
+    "fallback_vat_percent": 25.5,
+    "revalidate_hours": 6,
+    "fetch_interval": 60,
+    "chart_back_hours": 6,
+    "chart_fwd_hours": 24
+  },
+
+  "_throttle_comment": "Above 10 c/kWh -> driver minimum cap (sysfs power1_cap_min = 294 W on this card, read live, no low_watts needed). At/below -> restore_watts. 'default' would map to power1_cap_max (350 W) because AMD sysfs has no factory-default value, but this AIB card's intended default is the 327 W it reports when unthrottled, so pin it explicitly.",
+  "_throttle_devices_comment": "Only the 7900 XTX runs inference here, so only it is throttled. If the Quadro P2000 should join, append { \"gpu\": \"0000:04:00.0\", \"restore_watts\": \"default\" } - on NVIDIA 'default' is exact (driver power.default_limit, 75 W on a P2000) and the cheap-hours floor becomes its power.min_limit.",
+  "throttle": {
+    "enabled": true,
+    "threshold_c_per_kwh": 10.0,
+    "interval": 60,
+    "devices": [
+      { "gpu": "amd:0000:0b:00.0", "restore_watts": 327 }
+    ]
+  }
+}

@@ -579,8 +579,15 @@ def _amd_read_first(dev_dir, names, scale=1.0):
     return None
 
 
+_BDF_RE = re.compile(r'^[0-9a-f]{4,8}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$')
+
+
 def _amd_smi_info():
-    """bdf -> {name, uuid} from amd-smi static JSON, {} when unavailable."""
+    """bdf -> {name, uuid} from amd-smi static JSON, {} when unavailable.
+    The top-level key and nesting vary across ROCm releases ("gpu_data" on
+    current amd-smi, "static_info" on older ones), so walk each device blob
+    for the first BDF-looking string, market name and UUID instead of
+    hard-coding one layout."""
     rc, out = _sh(['amd-smi', 'static', '--json'])
     if rc != 0:
         return {}
@@ -589,26 +596,48 @@ def _amd_smi_info():
     except ValueError:
         return {}
 
-    def pick(d, *keys):
-        for k in keys:
-            if isinstance(d, dict) and d.get(k) not in (None, ''):
-                return d[k]
+    def walk(obj, pairs):
+        if isinstance(obj, dict):
+            for k, v in obj.items():
+                if isinstance(v, (dict, list)):
+                    walk(v, pairs)
+                else:
+                    pairs.append((str(k).lower(), v))
+        elif isinstance(obj, list):
+            for v in obj:
+                walk(v, pairs)
+        return pairs
+
+    def val(pairs, *keys):
+        for want in keys:
+            for k, v in pairs:
+                if k == want and v not in (None, ''):
+                    return v
         return None
+
     items = data if isinstance(data, list) else \
-        data.get('static_info') or data.get('data') or data.get('devices') or []
+        (data.get('gpu_data') or data.get('static_info') or
+         data.get('data') or data.get('devices') or [])
     out_map = {}
     for it in items if isinstance(items, list) else []:
         if not isinstance(it, dict):
             continue
-        bdf = pick(it, 'bus_location', 'pci_address', 'bdf', 'pci_bus_id')
-        dev = it.get('device_info') if isinstance(it.get('device_info'), dict) else it
-        name = pick(dev, 'market_name', 'marketing_name', 'sku', 'market_name_brand') or \
-            pick(it, 'market_name', 'sku')
-        uuid = pick(it, 'uuid') or pick(dev, 'uuid')
+        pairs = walk(it, [])
+        bdf = val(pairs, 'bus_location', 'pci_address', 'bdf', 'pci_bus_id',
+                  'bus_id', 'bus')
+        if bdf is None:      # last resort: any value that parses as a BDF
+            bdf = next((v.strip() for k, v in pairs
+                        if isinstance(v, str) and _BDF_RE.match(v.strip().lower())),
+                       None)
+        name = val(pairs, 'market_name', 'marketing_name', 'sku',
+                   'market_name_brand')
+        uuid = val(pairs, 'uuid')
         if bdf:
-            bdf = str(bdf).lower()
-            if len(bdf) == 12 and bdf[4] == ':' and bdf[:2] != '00':
-                bdf = '0000:' + bdf
+            bdf = str(bdf).strip().lower()
+            if re.match(r'^[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$', bdf):
+                bdf = '0000:' + bdf          # domain-less "0b:00.0" form
+            elif len(bdf) == 12 and bdf[4] == ':' and bdf[:2] != '00':
+                bdf = '0000:' + bdf         # amd-smi may drop the full domain
             out_map[bdf] = {'name': name, 'uuid': uuid}
     return out_map
 
